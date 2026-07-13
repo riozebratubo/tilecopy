@@ -1,0 +1,112 @@
+#include "chunkdb.h"
+
+#include "util.h"
+
+#include <windows.h>
+
+#include <format>
+#include <fstream>
+
+namespace tc {
+
+namespace {
+
+constexpr std::uint32_t kMagic = 0x42444354;   // "TCDB" little-endian
+constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kMaxPathBytes = 1u << 20;
+
+template <typename T>
+bool read_pod(std::istream& in, T& v) {
+    return static_cast<bool>(in.read(reinterpret_cast<char*>(&v), sizeof v));
+}
+
+template <typename T>
+void write_pod(std::ostream& out, const T& v) {
+    out.write(reinterpret_cast<const char*>(&v), sizeof v);
+}
+
+} // namespace
+
+bool ChunkDatabase::load(const std::filesystem::path& db_file, std::uint64_t expected_chunk_size,
+                         ChunkDatabase& out) {
+    std::ifstream in(db_file, std::ios::binary);
+    if (!in) return false;
+
+    std::uint32_t magic = 0, version = 0;
+    std::uint64_t chunk_size = 0, file_count = 0;
+    if (!read_pod(in, magic) || !read_pod(in, version) ||
+        !read_pod(in, chunk_size) || !read_pod(in, file_count))
+        return false;
+    if (magic != kMagic || version != kVersion || chunk_size != expected_chunk_size)
+        return false;
+
+    ChunkDatabase db;
+    db.chunk_size = chunk_size;
+    for (std::uint64_t i = 0; i < file_count; ++i) {
+        std::uint32_t path_bytes = 0;
+        if (!read_pod(in, path_bytes) || path_bytes > kMaxPathBytes) return false;
+        std::string path_utf8(path_bytes, '\0');
+        if (path_bytes && !in.read(path_utf8.data(), path_bytes)) return false;
+
+        FileRecord rec;
+        std::uint64_t chunk_count = 0;
+        if (!read_pod(in, rec.file_size) || !read_pod(in, rec.source_write_time) ||
+            !read_pod(in, chunk_count))
+            return false;
+        // A record can never have more chunks than its size implies.
+        if (chunk_count > rec.file_size / chunk_size + 1) return false;
+        rec.chunks.resize(chunk_count);
+        if (chunk_count &&
+            !in.read(reinterpret_cast<char*>(rec.chunks.data()),
+                     static_cast<std::streamsize>(chunk_count * sizeof(Sha256))))
+            return false;
+
+        db.files.emplace(utf8_to_wide(path_utf8), std::move(rec));
+    }
+
+    out = std::move(db);
+    return true;
+}
+
+bool ChunkDatabase::save(const std::filesystem::path& db_file, std::wstring& error) const {
+    std::filesystem::path tmp = db_file;
+    tmp += L".tmp";
+
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            error = std::format(L"cannot create database file {}", tmp.native());
+            return false;
+        }
+        write_pod(out, kMagic);
+        write_pod(out, kVersion);
+        write_pod(out, chunk_size);
+        write_pod(out, static_cast<std::uint64_t>(files.size()));
+        for (const auto& [path, rec] : files) {
+            const std::string path_utf8 = wide_to_utf8(path);
+            write_pod(out, static_cast<std::uint32_t>(path_utf8.size()));
+            out.write(path_utf8.data(), static_cast<std::streamsize>(path_utf8.size()));
+            write_pod(out, rec.file_size);
+            write_pod(out, rec.source_write_time);
+            write_pod(out, static_cast<std::uint64_t>(rec.chunks.size()));
+            if (!rec.chunks.empty())
+                out.write(reinterpret_cast<const char*>(rec.chunks.data()),
+                          static_cast<std::streamsize>(rec.chunks.size() * sizeof(Sha256)));
+        }
+        out.flush();
+        if (!out) {
+            error = std::format(L"failed writing database file {}", tmp.native());
+            return false;
+        }
+    }
+
+    if (!::MoveFileExW(extended_path(tmp).c_str(), extended_path(db_file).c_str(),
+                       MOVEFILE_REPLACE_EXISTING)) {
+        error = std::format(L"cannot replace database file {}: {}",
+                            db_file.native(), win32_error_message(::GetLastError()));
+        return false;
+    }
+    return true;
+}
+
+} // namespace tc
