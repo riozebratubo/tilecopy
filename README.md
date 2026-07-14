@@ -32,16 +32,20 @@ Common options:
 | `--make-db` | Only (re)generate the chunk database, copy nothing; destination may be omitted |
 | `--chunk-size <size>` | Delta chunk size, `4K`–`64M` (`K`/`M` suffixes or plain bytes, default `1M`). A database built with a different chunk size is discarded and rebuilt |
 | `--max-tries <n>` | Attempts per file before giving up (default **1**) |
+| `--no-file-logs` | Do not print a line per file copied/moved; only the initial and final messages (and errors) are printed |
 
 Folder/drive options:
 
 | Option | Meaning |
 |---|---|
 | `--mirror` | Delete destination entries that do not exist in the source |
+| `--no-move-detection` | Do not detect moved/renamed source files (see below) |
+| `--move-detection-check-date` | Only consider move candidates whose last-write time also matches the record. Cuts down how many new files must be hashed, but misses moves done by tools that rewrite write times (e.g. Explorer copies) |
 | `--exclude-file <p>` | Exclude a file (repeatable; absolute or relative to the source root). Left untouched on the destination when mirroring |
 | `--exclude-folder <p>` | Exclude a folder subtree (repeatable, same semantics) |
 | `--mt` | Enable multithreaded copying (default: off) |
 | `--threads <n>` | Max worker threads, 1–32 (default 8; only used with `--mt`) |
+| `--folder-logs` | Instead of a line per file, print one line per folder checked with the number of files copied from it (implies `--no-file-logs`) |
 
 ## Behavior
 
@@ -51,6 +55,14 @@ Folder/drive options:
   otherwise a full copy is performed (and the database refreshed). Files whose
   size + last-write time match the database and whose destination looks intact
   are skipped entirely.
+- **Move detection** (folder/drive, on by default): a database record whose
+  path truly vanished from the source paired with a new source file of the
+  same size whose content matches (the new file is hashed and compared to the
+  recorded chunk hashes) is renamed at the destination instead of re-copied,
+  and the record is adopted under the new path. Write times are ignored by
+  default because tools like Explorer rewrite them when copying;
+  `--move-detection-check-date` requires them to match too. Disable with
+  `--no-move-detection`.
 - **Drive copies** skip NTFS metadata files (`$MFT`, `$LogFile`, `$Extend`, …),
   `$Recycle.Bin`, `System Volume Information`, and the pagefile family at the
   drive root. The destination may be a drive or a folder; the source drive's
@@ -67,7 +79,8 @@ Folder/drive options:
 - **Empty folders** are always created.
 - Only local drives (fixed/removable) are supported; UNC paths and mapped
   network drives are rejected.
-- Exit codes: `0` success, `1` bad arguments/setup, `2` completed with failures.
+- Exit codes: `0` success, `1` bad arguments/setup, `2` completed with
+  failures (or the database could not be saved).
 
 ## Design decisions
 
