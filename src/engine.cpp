@@ -617,6 +617,22 @@ int run(const Options& opt) {
             job.dst_root /= opt.source.filename();
     }
     job.excl.build(opt);
+    // A destination inside the source tree would be walked while being
+    // written to, copying the copy into itself; only an excluded destination
+    // (which the walk skips) is safe.
+    if (job.copying && opt.mode != Mode::File) {
+        const std::wstring src_norm = norm_path(job.src_root);
+        const std::wstring dst_norm = norm_path(job.dst_root);
+        const bool inside = dst_norm == src_norm ||
+                            (dst_norm.starts_with(src_norm) &&
+                             (src_norm.back() == L'\\' || dst_norm[src_norm.size()] == L'\\'));
+        if (inside && !job.excl.excluded(dst_norm)) {
+            log_error(std::format(L"destination {} is inside the source {}; exclude it with "
+                                  L"--exclude-folder to copy anyway",
+                                  opt.destination.native(), opt.source.native()));
+            return 1;
+        }
+    }
     job.db_file = resolve_db_path(opt, job.dst_root);
     job.db_norm = norm_path(job.db_file);
     job.db_tmp_norm = job.db_norm + L".tmp";

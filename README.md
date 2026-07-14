@@ -18,9 +18,9 @@ cmake --build build --config Release
 ## Usage
 
 ```
-tilecopy --file   <source-file> <dest-file>  [options]
-tilecopy --folder <source-dir>  <dest-dir>   [options]
-tilecopy --drive  <X:>          <Y:>         [options]
+tilecopy --file   <source-file> <dest-file>   [options]
+tilecopy --folder <source-dir>  <dest-dir>    [options]
+tilecopy --drive  <X:>          <Y:|dest-dir> [options]
 tilecopy --file/--folder/--drive <source> --make-db [options]
 ```
 
@@ -53,7 +53,11 @@ Folder/drive options:
   are skipped entirely.
 - **Drive copies** skip NTFS metadata files (`$MFT`, `$LogFile`, `$Extend`, …),
   `$Recycle.Bin`, `System Volume Information`, and the pagefile family at the
-  drive root.
+  drive root. The destination may be a drive or a folder; the source drive's
+  contents are copied into it.
+- A folder/drive **destination inside the source tree** (e.g.
+  `--drive C: C:\backup`) is rejected — it would be copied into itself — unless
+  it is covered by `--exclude-folder`.
 - **Metadata** (attributes, creation/access/write times, owner/group/DACL, and
   SACL when running elevated) is always copied, best-effort, for files and
   folders. Directory timestamps are applied children-first so they survive.

@@ -18,9 +18,9 @@ void print_usage() {
         LR"( - delta-copy files, folders or whole drives between local drives
 
 Usage:
-  tilecopy --file   <source-file> <dest-file>  [options]
-  tilecopy --folder <source-dir>  <dest-dir>   [options]
-  tilecopy --drive  <X:>          <Y:>         [options]
+  tilecopy --file   <source-file> <dest-file>   [options]
+  tilecopy --folder <source-dir>  <dest-dir>    [options]
+  tilecopy --drive  <X:>          <Y:|dest-dir> [options]
   tilecopy --file/--folder/--drive <source> --make-db [options]
 
 Common options:
@@ -56,6 +56,9 @@ Folder and drive options:
   --threads <n>          Max worker threads, 1-32 (default 8; needs --mt)
 
 Notes:
+  - A --drive destination may be a drive or a folder; the source drive's
+    contents are copied into it. A destination inside the source tree is
+    rejected unless it is covered by --exclude-folder.
   - Only local drives are supported (no network drives or UNC paths).
   - Empty folders are always copied; symbolic links, junctions and other
     reparse points are copied as links, never followed.
@@ -211,13 +214,11 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
                    ((s[0] >= L'A' && s[0] <= L'Z') || (s[0] >= L'a' && s[0] <= L'z')) && s[1] == L':';
         };
         if (!is_drive(opt.source)) { fail(L"--drive source must be a drive like X: or X:\\"); return std::nullopt; }
-        if (!opt.destination.empty() && !is_drive(opt.destination)) {
-            fail(L"--drive destination must be a drive like Y: or Y:\\");
-            return std::nullopt;
-        }
-        // Normalize to X:\ so the paths are proper roots, not drive-relative.
+        // Normalize to X:\ so the path is a proper root, not drive-relative.
         opt.source = std::wstring{opt.source.native()[0], L':', L'\\'};
-        if (!opt.destination.empty())
+        // The destination may be a drive or a folder; only a drive spec needs
+        // the same root normalization.
+        if (!opt.destination.empty() && is_drive(opt.destination))
             opt.destination = std::wstring{opt.destination.native()[0], L':', L'\\'};
     }
 
