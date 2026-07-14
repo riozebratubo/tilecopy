@@ -29,6 +29,9 @@ struct Options {
     int max_threads = 8; // 1..32
 
     int max_tries = 1;
+
+    bool file_logs = true;    // --no-file-logs (also cleared by --folder-logs)
+    bool folder_logs = false; // folder / drive only
 };
 
 // Returns std::nullopt after printing an error (or usage for --help).

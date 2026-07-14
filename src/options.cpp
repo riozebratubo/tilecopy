@@ -34,6 +34,8 @@ Common options:
                          (default 1M; a database built with a different chunk
                          size is discarded and rebuilt)
   --max-tries <n>        Attempts per file before giving up (default 1)
+  --no-file-logs         Do not print a line per file copied; only the initial
+                         and final messages (and errors) are printed
 
 Folder and drive options:
   --mirror               Delete destination entries that do not exist in the
@@ -54,6 +56,8 @@ Folder and drive options:
   --exclude-folder <p>   Folder subtree to exclude (repeatable)
   --mt                   Enable multithreaded copying (default: off)
   --threads <n>          Max worker threads, 1-32 (default 8; needs --mt)
+  --folder-logs          Instead of a line per file, print one line per folder
+                         checked with the number of files copied from it
 
 Notes:
   - A --drive destination may be a drive or a folder; the source drive's
@@ -151,6 +155,10 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
             const wchar_t* v = next_value(L"--exclude-folder");
             if (!v) return std::nullopt;
             opt.exclude_folders.emplace_back(v);
+        } else if (arg == L"--no-file-logs") {
+            opt.file_logs = false;
+        } else if (arg == L"--folder-logs") {
+            opt.folder_logs = true;
         } else if (arg == L"--mt") {
             opt.multithread = true;
         } else if (arg == L"--threads") {
@@ -205,7 +213,14 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
             return std::nullopt;
         }
         if (opt.multithread) { fail(L"--mt is only valid with --folder or --drive"); return std::nullopt; }
+        if (opt.folder_logs) {
+            fail(L"--folder-logs is only valid with --folder or --drive");
+            return std::nullopt;
+        }
     }
+
+    // Folder logging replaces the per-file lines.
+    if (opt.folder_logs) opt.file_logs = false;
 
     if (opt.mode == Mode::Drive) {
         auto is_drive = [](const std::filesystem::path& p) {

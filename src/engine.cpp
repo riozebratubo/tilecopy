@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cwchar>
+#include <deque>
 #include <cwctype>
 #include <format>
 #include <set>
@@ -29,6 +30,15 @@ struct CopyStats {
         deleted{0}, hashed{0}, bytes_written{0}, bytes_skipped{0};
 };
 
+// One entry per folder checked with --folder-logs. The last file task of the
+// folder to finish prints it; folders with no file tasks print during the walk.
+struct FolderLog {
+    explicit FolderLog(std::wstring l) : label(std::move(l)) {}
+    std::wstring label;
+    std::atomic<std::uint32_t> pending{0};
+    std::atomic<std::uint32_t> copied{0};
+};
+
 struct FileTask {
     fs::path src;
     fs::path dst;
@@ -37,6 +47,7 @@ struct FileTask {
     bool had_record = false;
     std::uint64_t src_size = 0;       // from the directory walk
     std::int64_t src_write_time = 0;  // FILETIME from the directory walk
+    FolderLog* flog = nullptr;
 };
 
 std::wstring norm_path(const fs::path& p) {
@@ -76,6 +87,7 @@ struct Job {
     std::wstring db_norm, db_tmp_norm;
     Excluder excl;
     std::vector<FileTask> tasks;
+    std::deque<FolderLog> folder_logs; // stable addresses; filled by the walk only
     std::vector<std::pair<fs::path, fs::path>> dir_meta; // post-order (children first)
     std::set<std::wstring> seen_keys;
     CopyStats stats;
@@ -220,11 +232,17 @@ void handle_link(Job& job, const fs::path& src, const fs::path& dst, bool is_dir
         std::wstring merr;
         copy_metadata(src, dst, is_dir, merr);
         job.stats.links.fetch_add(1, std::memory_order_relaxed);
-        log_info(L"link     " + rel);
+        if (job.opt->file_logs) log_info(L"link     " + rel);
     } else {
         job.stats.failed.fetch_add(1, std::memory_order_relaxed);
         log_error(std::format(L"link {} failed: {}", rel, err));
     }
+}
+
+void log_folder_checked(const Job& job, const FolderLog& fl) {
+    log_info(std::format(L"checked  {} ({} file(s) {})", fl.label,
+                         fl.copied.load(std::memory_order_relaxed),
+                         job.copying ? L"copied" : L"hashed"));
 }
 
 void walk_dir(Job& job, const fs::path& sdir, const fs::path& ddir, const std::wstring& rel,
@@ -245,6 +263,10 @@ void walk_dir(Job& job, const fs::path& sdir, const fs::path& ddir, const std::w
         }
         return;
     }
+
+    FolderLog* flog = nullptr;
+    if (job.opt->folder_logs)
+        flog = &job.folder_logs.emplace_back(rel.empty() ? sdir.native() : rel);
 
     do {
         const wchar_t* name = fd.cFileName;
@@ -282,14 +304,22 @@ void walk_dir(Job& job, const fs::path& sdir, const fs::path& ddir, const std::w
             job.seen_keys.insert(child_rel);
             const std::uint64_t fsize =
                 (static_cast<std::uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+            if (flog) flog->pending.fetch_add(1, std::memory_order_relaxed);
             job.tasks.push_back({spath, dpath, child_rel, &it->second, !inserted, fsize,
-                                 filetime_to_i64(fd.ftLastWriteTime)});
+                                 filetime_to_i64(fd.ftLastWriteTime), flog});
         }
     } while (::FindNextFileW(hf, &fd));
     ::FindClose(hf);
+
+    // A folder without file tasks is fully checked already; the others are
+    // printed by run_task when their last file finishes.
+    if (flog && flog->pending.load(std::memory_order_relaxed) == 0)
+        log_folder_checked(job, *flog);
 }
 
-void run_task(Job& job, FileTask& t) {
+// Returns true when the file was actually copied (or hashed with --make-db),
+// so --folder-logs can count it.
+bool run_task_copy(Job& job, FileTask& t) {
     if (job.copying) prepare_file_slot(t.dst);
 
     DeltaResult r;
@@ -304,17 +334,17 @@ void run_task(Job& job, FileTask& t) {
     if (!r.ok) {
         job.stats.failed.fetch_add(1, std::memory_order_relaxed);
         log_error(std::format(L"copy {} failed: {}", label, r.error));
-        return;
+        return false;
     }
 
     if (!job.copying) {
         job.stats.hashed.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return true;
     }
     if (r.skipped) {
         job.stats.skipped.fetch_add(1, std::memory_order_relaxed);
         job.stats.bytes_skipped.fetch_add(r.bytes_skipped, std::memory_order_relaxed);
-        return;
+        return false;
     }
 
     std::wstring merr;
@@ -324,11 +354,24 @@ void run_task(Job& job, FileTask& t) {
     job.stats.copied.fetch_add(1, std::memory_order_relaxed);
     job.stats.bytes_written.fetch_add(r.bytes_written, std::memory_order_relaxed);
     job.stats.bytes_skipped.fetch_add(r.bytes_skipped, std::memory_order_relaxed);
-    if (r.delta_used)
-        log_info(std::format(L"copied   {} (delta: {} written, {} unchanged)", label,
-                             human_bytes(r.bytes_written), human_bytes(r.bytes_skipped)));
-    else
-        log_info(std::format(L"copied   {} ({})", label, human_bytes(r.bytes_written)));
+    if (job.opt->file_logs) {
+        if (r.delta_used)
+            log_info(std::format(L"copied   {} (delta: {} written, {} unchanged)", label,
+                                 human_bytes(r.bytes_written), human_bytes(r.bytes_skipped)));
+        else
+            log_info(std::format(L"copied   {} ({})", label, human_bytes(r.bytes_written)));
+    }
+    return true;
+}
+
+void run_task(Job& job, FileTask& t) {
+    const bool counted = run_task_copy(job, t);
+    if (!t.flog) return;
+    if (counted) t.flog->copied.fetch_add(1, std::memory_order_relaxed);
+    // acq_rel so the thread that finishes the folder sees every worker's
+    // `copied` increment, which is sequenced before its decrement.
+    if (t.flog->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        log_folder_checked(job, *t.flog);
 }
 
 void process_tasks(Job& job) {
@@ -497,7 +540,7 @@ void detect_moves(Job& job) {
             job.db.files.erase(old_rel);
             bucket.erase(it);
             job.stats.moved.fetch_add(1, std::memory_order_relaxed);
-            log_info(std::format(L"moved    {} -> {}", old_rel, t.rel));
+            if (opt.file_logs) log_info(std::format(L"moved    {} -> {}", old_rel, t.rel));
             break;
         }
     }
@@ -531,7 +574,7 @@ void mirror_dir(Job& job, const fs::path& ddir, const fs::path& sdir, int depth)
         if (sattrs == INVALID_FILE_ATTRIBUTES) {
             std::uint64_t removed = 0;
             if (remove_tree(dpath, fd.dwFileAttributes, removed)) {
-                log_info(L"deleted  " + dpath.native());
+                if (job.opt->file_logs) log_info(L"deleted  " + dpath.native());
             } else {
                 job.stats.failed.fetch_add(1, std::memory_order_relaxed);
                 log_error(std::format(L"cannot delete {}: {}", dpath.native(),
