@@ -56,6 +56,13 @@ std::wstring extended_path(const std::filesystem::path& p) {
     return LR"(\\?\)" + native;
 }
 
+std::int64_t filetime_to_i64(const FILETIME& ft) {
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return static_cast<std::int64_t>(u.QuadPart);
+}
+
 std::wstring human_bytes(unsigned long long bytes) {
     constexpr const wchar_t* units[] = {L"B", L"KiB", L"MiB", L"GiB", L"TiB"};
     double v = static_cast<double>(bytes);

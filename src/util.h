@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -16,6 +17,8 @@ std::wstring win32_error_message(DWORD err);
 
 // Absolute path with the \\?\ prefix so long paths work everywhere.
 std::wstring extended_path(const std::filesystem::path& p);
+
+std::int64_t filetime_to_i64(const FILETIME& ft);
 
 std::wstring human_bytes(unsigned long long bytes);
 

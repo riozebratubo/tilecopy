@@ -22,13 +22,6 @@ bool fail(DeltaResult& r, const std::wstring& what) {
     return false;
 }
 
-std::int64_t filetime_to_i64(const FILETIME& ft) {
-    ULARGE_INTEGER u;
-    u.LowPart = ft.dwLowDateTime;
-    u.HighPart = ft.dwHighDateTime;
-    return static_cast<std::int64_t>(u.QuadPart);
-}
-
 bool write_at(HANDLE h, std::uint64_t offset, const void* data, DWORD len) {
     LARGE_INTEGER pos;
     pos.QuadPart = static_cast<LONGLONG>(offset);

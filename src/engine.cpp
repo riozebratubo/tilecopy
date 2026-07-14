@@ -25,8 +25,8 @@ namespace fs = std::filesystem;
 namespace {
 
 struct CopyStats {
-    std::atomic<std::uint64_t> copied{0}, skipped{0}, failed{0}, links{0}, deleted{0},
-        hashed{0}, bytes_written{0}, bytes_skipped{0};
+    std::atomic<std::uint64_t> copied{0}, skipped{0}, moved{0}, failed{0}, links{0},
+        deleted{0}, hashed{0}, bytes_written{0}, bytes_skipped{0};
 };
 
 struct FileTask {
@@ -35,6 +35,8 @@ struct FileTask {
     std::wstring rel;
     FileRecord* record = nullptr;
     bool had_record = false;
+    std::uint64_t src_size = 0;       // from the directory walk
+    std::int64_t src_write_time = 0;  // FILETIME from the directory walk
 };
 
 std::wstring norm_path(const fs::path& p) {
@@ -278,7 +280,10 @@ void walk_dir(Job& job, const fs::path& sdir, const fs::path& ddir, const std::w
         } else {
             auto [it, inserted] = job.db.files.try_emplace(child_rel);
             job.seen_keys.insert(child_rel);
-            job.tasks.push_back({spath, dpath, child_rel, &it->second, !inserted});
+            const std::uint64_t fsize =
+                (static_cast<std::uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+            job.tasks.push_back({spath, dpath, child_rel, &it->second, !inserted, fsize,
+                                 filetime_to_i64(fd.ftLastWriteTime)});
         }
     } while (::FindNextFileW(hf, &fd));
     ::FindClose(hf);
@@ -347,6 +352,154 @@ void process_tasks(Job& job) {
                 run_task(job, job.tasks[i]);
             }
         });
+    }
+}
+
+// Reads src sequentially and fills `out` with the SHA-256 of each chunk.
+// `out` is left empty on failure so partial results can never be matched.
+bool hash_file_chunks(const fs::path& src, std::uint64_t chunk_size, std::vector<Sha256>& out) {
+    HANDLE h = ::CreateFileW(extended_path(src).c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    thread_local Sha256Hasher hasher;
+    bool ok = hasher.valid();
+    std::vector<std::uint8_t> buf(chunk_size);
+    while (ok) {
+        DWORD read = 0;
+        if (!::ReadFile(h, buf.data(), static_cast<DWORD>(chunk_size), &read, nullptr))
+            ok = false;
+        else if (read == 0)
+            break;
+        else
+            out.push_back(hasher.hash(buf.data(), read));
+    }
+    ::CloseHandle(h);
+    if (!ok) out.clear();
+    return ok;
+}
+
+// Detects source files that moved since the last run: a database record whose
+// path truly vanished from the source paired with a new source file of the
+// same size whose content matches — the new file is hashed and its chunk
+// hashes must equal the record's. Write times are ignored by default because
+// tools like Explorer rewrite them when copying; --move-detection-check-date
+// requires them to match too, which shrinks the set of files to hash. On a
+// match the destination copy is renamed instead of re-copied and the record
+// is adopted under the new path, so later runs delta against it as usual.
+void detect_moves(Job& job) {
+    const Options& opt = *job.opt;
+    const bool check_date = opt.move_detection_check_date;
+    using Key = std::pair<std::uint64_t, std::int64_t>; // size, write time (0 unless checked)
+
+    struct Orphan {
+        std::wstring rel;
+        FileRecord* rec = nullptr;
+    };
+    std::map<Key, std::vector<Orphan>> orphans;
+    for (auto& [rel, rec] : job.db.files) {
+        if (rec.file_size == 0 || job.seen_keys.contains(rel)) continue;
+        // A record is only a move source when the file is truly gone from the
+        // source; newly excluded entries and subtrees that failed to enumerate
+        // also miss seen_keys and must not have their destinations renamed away.
+        if (::GetFileAttributesW(extended_path(job.src_root / rel).c_str()) !=
+            INVALID_FILE_ATTRIBUTES)
+            continue;
+        orphans[{rec.file_size, check_date ? rec.source_write_time : 0}].push_back({rel, &rec});
+    }
+    if (orphans.empty()) return;
+
+    std::vector<FileTask*> cands;
+    for (auto& t : job.tasks) {
+        if (t.had_record || t.src_size == 0) continue;
+        const auto it = orphans.find({t.src_size, check_date ? t.src_write_time : 0});
+        if (it != orphans.end() && !it->second.empty()) cands.push_back(&t);
+    }
+    if (cands.empty()) return;
+
+    // Hash every candidate once up front (in parallel with --mt). A candidate
+    // that ends up not matching is read again by the copy path; that is the
+    // price of content-verified pairing and only hits new files that happen
+    // to share a size with a vanished one.
+    std::vector<std::vector<Sha256>> cand_chunks(cands.size());
+    {
+        const size_t workers = (opt.multithread && opt.max_threads > 1)
+                                   ? std::min<size_t>(opt.max_threads, cands.size())
+                                   : 1;
+        if (workers <= 1) {
+            for (size_t i = 0; i < cands.size(); ++i)
+                hash_file_chunks(cands[i]->src, opt.chunk_size, cand_chunks[i]);
+        } else {
+            std::atomic<size_t> next{0};
+            std::vector<std::jthread> pool;
+            pool.reserve(workers);
+            for (size_t w = 0; w < workers; ++w) {
+                pool.emplace_back([&] {
+                    for (;;) {
+                        const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= cands.size()) break;
+                        hash_file_chunks(cands[i]->src, opt.chunk_size, cand_chunks[i]);
+                    }
+                });
+            }
+        }
+    }
+
+    for (size_t i = 0; i < cands.size(); ++i) {
+        FileTask& t = *cands[i];
+        if (cand_chunks[i].empty()) continue; // unreadable; the copy path reports it
+        auto& bucket = orphans[{t.src_size, check_date ? t.src_write_time : 0}];
+
+        for (auto it = bucket.begin(); it != bucket.end();) {
+            if (it->rec->chunks != cand_chunks[i]) {
+                ++it;
+                continue;
+            }
+
+            // Only rename what the record still describes: a plain file of
+            // the recorded size. Anything else is of no use to any candidate.
+            const fs::path old_dst = job.dst_root / it->rel;
+            const std::wstring old_ext = extended_path(old_dst);
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            const bool dst_good =
+                ::GetFileAttributesExW(old_ext.c_str(), GetFileExInfoStandard, &fad) &&
+                !(fad.dwFileAttributes &
+                  (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+                ((static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow) ==
+                    it->rec->file_size;
+            if (!dst_good) {
+                it = bucket.erase(it);
+                continue;
+            }
+
+            const std::wstring new_ext = extended_path(t.dst);
+            if (norm_path(old_dst) != norm_path(t.dst)) {
+                // Clear whatever occupies the target slot; it has no record,
+                // so a full copy was inevitable there anyway.
+                prepare_file_slot(t.dst);
+                if (::GetFileAttributesW(new_ext.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    delete_plain_file(t.dst);
+            }
+            if (!::MoveFileExW(old_ext.c_str(), new_ext.c_str(), 0)) {
+                log_info(std::format(L"move {} -> {} failed ({}); copying instead", it->rel,
+                                     t.rel, win32_error_message(::GetLastError())));
+                break; // target slot problem; let the normal copy handle it
+            }
+
+            const std::wstring old_rel = it->rel;
+            *t.record = std::move(*it->rec);
+            // Content equality was verified against the record, so the new
+            // write time can be adopted too; run_task then skips the file
+            // without reading it again.
+            t.record->source_write_time = t.src_write_time;
+            t.had_record = true;
+            job.db.files.erase(old_rel);
+            bucket.erase(it);
+            job.stats.moved.fetch_add(1, std::memory_order_relaxed);
+            log_info(std::format(L"moved    {} -> {}", old_rel, t.rel));
+            break;
+        }
     }
 }
 
@@ -494,6 +647,7 @@ int run(const Options& opt) {
         }
 
         walk_dir(job, job.src_root, job.dst_root, L"", 0);
+        if (job.copying && opt.move_detection) detect_moves(job);
         process_tasks(job);
 
         if (job.copying) {
@@ -528,11 +682,11 @@ int run(const Options& opt) {
                              s.hashed.load(), s.failed.load()));
     } else {
         log_info(std::format(
-            L"done: {} copied ({} written, {} unchanged), {} up-to-date, {} link(s), "
-            L"{} deleted, {} failed",
+            L"done: {} copied ({} written, {} unchanged), {} moved, {} up-to-date, "
+            L"{} link(s), {} deleted, {} failed",
             s.copied.load(), human_bytes(s.bytes_written.load()),
-            human_bytes(s.bytes_skipped.load()), s.skipped.load(), s.links.load(),
-            s.deleted.load(), s.failed.load()));
+            human_bytes(s.bytes_skipped.load()), s.moved.load(), s.skipped.load(),
+            s.links.load(), s.deleted.load(), s.failed.load()));
     }
     log_info(format_time_spent(elapsed));
 

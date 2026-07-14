@@ -38,6 +38,17 @@ Common options:
 Folder and drive options:
   --mirror               Delete destination entries that do not exist in the
                          source (excluded entries are left untouched)
+  --no-move-detection    Do not detect moved/renamed source files. By default
+                         a file recorded in the database that disappeared from
+                         one source path and reappeared at another with the
+                         same size and content (the new file is hashed and
+                         compared to the recorded chunk hashes) is renamed at
+                         the destination instead of being copied again
+  --move-detection-check-date
+                         Only consider move candidates whose last-write time
+                         also matches the record. Cuts down how many new files
+                         must be hashed, but misses moves done by tools that
+                         rewrite write times (e.g. Explorer copies)
   --exclude-file <p>     File to exclude (repeatable; absolute or relative to
                          the source root)
   --exclude-folder <p>   Folder subtree to exclude (repeatable)
@@ -125,6 +136,10 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
             opt.chunk_size = bytes;
         } else if (arg == L"--mirror") {
             opt.mirror = true;
+        } else if (arg == L"--no-move-detection") {
+            opt.move_detection = false;
+        } else if (arg == L"--move-detection-check-date") {
+            opt.move_detection_check_date = true;
         } else if (arg == L"--exclude-file") {
             const wchar_t* v = next_value(L"--exclude-file");
             if (!v) return std::nullopt;
@@ -170,9 +185,18 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
         fail(L"--mirror cannot be combined with --make-db");
         return std::nullopt;
     }
+    if (!opt.move_detection && opt.move_detection_check_date) {
+        fail(L"--move-detection-check-date cannot be combined with --no-move-detection");
+        return std::nullopt;
+    }
 
     if (opt.mode == Mode::File) {
         if (opt.mirror) { fail(L"--mirror is only valid with --folder or --drive"); return std::nullopt; }
+        if (!opt.move_detection || opt.move_detection_check_date) {
+            fail(L"--no-move-detection and --move-detection-check-date are only valid "
+                 L"with --folder or --drive");
+            return std::nullopt;
+        }
         if (!opt.exclude_files.empty() || !opt.exclude_folders.empty()) {
             fail(L"--exclude-file/--exclude-folder are only valid with --folder or --drive");
             return std::nullopt;

@@ -21,6 +21,8 @@ struct Options {
 
     // folder / drive only
     bool mirror = false;
+    bool move_detection = true;
+    bool move_detection_check_date = false;
     std::vector<std::filesystem::path> exclude_files;
     std::vector<std::filesystem::path> exclude_folders;
     bool multithread = false;

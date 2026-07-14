@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(tilecopy VERSION 1.0.1 LANGUAGES CXX)
+project(tilecopy VERSION 1.0.2 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "tilecopy is a Windows-only tool.")
