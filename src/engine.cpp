@@ -397,6 +397,17 @@ void mirror_dir(Job& job, const fs::path& ddir, const fs::path& sdir, int depth)
     ::FindClose(hf);
 }
 
+// "time spent: <days>d <hh>:<mm>:<ss.ss> or <total_ms>ms"
+std::wstring format_time_spent(std::chrono::milliseconds elapsed) {
+    const auto total_ms = elapsed.count();
+    const auto days = total_ms / 86'400'000;
+    const auto hours = (total_ms / 3'600'000) % 24;
+    const auto minutes = (total_ms / 60'000) % 60;
+    const double seconds = (total_ms % 60'000) / 1000.0;
+    return std::format(L"time spent: {}d {:02}:{:02}:{:05.2f} or {}ms",
+                       days, hours, minutes, seconds, total_ms);
+}
+
 int run_single_file(Job& job) {
     const Options& opt = *job.opt;
     const DWORD sattrs = ::GetFileAttributesW(extended_path(opt.source).c_str());
@@ -431,8 +442,6 @@ int run_single_file(Job& job) {
 } // namespace
 
 int run(const Options& opt) {
-    const auto started = std::chrono::steady_clock::now();
-
     std::wstring err;
     if (!check_local_drive(opt.source, err)) { log_error(err); return 1; }
     if (!opt.destination.empty() && !check_local_drive(opt.destination, err)) {
@@ -463,6 +472,8 @@ int run(const Options& opt) {
     job.db.chunk_size = opt.chunk_size;
     log_info(std::format(L"database: {} ({})", job.db_file.native(),
                          had_db ? L"loaded" : L"new"));
+
+    const auto started = std::chrono::steady_clock::now();
 
     if (opt.mode == Mode::File) {
         const int rc = run_single_file(job);
@@ -503,25 +514,27 @@ int run(const Options& opt) {
                       [&](const auto& kv) { return !job.seen_keys.contains(kv.first); });
     }
 
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                              started);
+
     std::wstring dberr;
     bool db_saved = job.db.save(job.db_file, dberr);
     if (!db_saved) log_error(dberr);
 
-    const auto elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                              started);
     const auto& s = job.stats;
     if (opt.make_db_only) {
-        log_info(std::format(L"done: {} file(s) hashed into database, {} failed, {:.1f}s",
-                             s.hashed.load(), s.failed.load(), elapsed.count() / 1000.0));
+        log_info(std::format(L"done: {} file(s) hashed into database, {} failed",
+                             s.hashed.load(), s.failed.load()));
     } else {
         log_info(std::format(
             L"done: {} copied ({} written, {} unchanged), {} up-to-date, {} link(s), "
-            L"{} deleted, {} failed, {:.1f}s",
+            L"{} deleted, {} failed",
             s.copied.load(), human_bytes(s.bytes_written.load()),
             human_bytes(s.bytes_skipped.load()), s.skipped.load(), s.links.load(),
-            s.deleted.load(), s.failed.load(), elapsed.count() / 1000.0));
+            s.deleted.load(), s.failed.load()));
     }
+    log_info(format_time_spent(elapsed));
 
     if (s.failed.load() > 0 || !db_saved) return 2;
     return 0;
