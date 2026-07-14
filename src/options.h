@@ -27,6 +27,7 @@ struct Options {
     std::vector<std::filesystem::path> exclude_folders;
     bool multithread = false;
     int max_threads = 8; // 1..32
+    bool ntfs_map_origin = false; // scan via the source volume's USN journal
 
     int max_tries = 1;
 

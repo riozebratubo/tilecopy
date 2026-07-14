@@ -46,6 +46,7 @@ Folder/drive options:
 | `--mt` | Enable multithreaded copying (default: off) |
 | `--threads <n>` | Max worker threads, 1–32 (default 8; only used with `--mt`) |
 | `--folder-logs` | Instead of a line per file, print one line per folder checked with the number of files copied from it (implies `--no-file-logs`) |
+| `--ntfs-map-origin` | Read the source volume's NTFS USN change journal to visit only entries changed since the last run instead of walking the whole tree. The journal position is stored in the database; needs administrator rights. Falls back to a full scan whenever the journal cannot be trusted (see below) |
 
 ## Behavior
 
@@ -77,6 +78,21 @@ Folder/drive options:
   never followed — including during mirror deletion. Creating symlinks may
   require elevation or Windows Developer Mode.
 - **Empty folders** are always created.
+- **USN incremental scans** (`--ntfs-map-origin`, folder/drive only): the
+  database additionally stores the source volume's USN journal identity and
+  position. Later runs read only the journal records since that position and
+  visit just the entries reported created/changed/renamed/deleted; every other
+  file — including its destination copy — is trusted as unchanged. This means
+  destination-side damage to untouched files goes unseen until the source
+  changes; run once without the flag (or delete the database) to force a full
+  verification pass. Reading the journal needs administrator rights. Any
+  condition that makes the journal untrustworthy — first run, non-NTFS source,
+  journal wrapped or recreated, different volume, changed exclude list, a
+  failed previous run, or a `--make-db`-only refresh followed by a copy —
+  automatically falls back to a full scan. Changes made through hard-link
+  aliases outside the source tree may be missed (hard-link topology is not
+  preserved anyway), and `--folder-logs` prints no per-folder lines on
+  incremental runs.
 - Only local drives (fixed/removable) are supported; UNC paths and mapped
   network drives are rejected.
 - Exit codes: `0` success, `1` bad arguments/setup, `2` completed with
@@ -101,3 +117,8 @@ Folder/drive options:
    as files.
 6. Alternate NTFS data streams and hard-link topology are **not** preserved
    (only the default stream is copied).
+7. **`--ntfs-map-origin` databases** use a version-2 layout carrying the
+   journal position; databases written without the flag keep the version-1
+   layout unchanged. Any failed entry invalidates the stored position, so the
+   next run walks everything instead of trusting a checkpoint that skipped a
+   broken file.

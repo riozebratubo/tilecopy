@@ -4,6 +4,7 @@
 #include "delta.h"
 #include "fsmeta.h"
 #include "reparse.h"
+#include "usnmap.h"
 #include "util.h"
 
 #include <windows.h>
@@ -593,6 +594,153 @@ void mirror_dir(Job& job, const fs::path& ddir, const fs::path& sdir, int depth)
     ::FindClose(hf);
 }
 
+// FNV-1a over the sorted, normalized exclude lists. Stored with the journal
+// position: an incremental run never visits files that stopped being
+// excluded, so a changed exclude set must force a full scan.
+std::uint64_t excludes_fingerprint(const Excluder& excl) {
+    std::vector<std::wstring> all;
+    all.reserve(excl.files.size() + excl.folders.size());
+    for (const auto& f : excl.files) all.push_back(L"f:" + f);
+    for (const auto& d : excl.folders) all.push_back(L"d:" + d);
+    std::ranges::sort(all);
+    std::uint64_t h = 14695981039346656037ull;
+    for (const auto& s : all) {
+        for (const wchar_t c : s) {
+            h ^= static_cast<std::uint64_t>(c);
+            h *= 1099511628211ull;
+        }
+        h ^= 0x1Full; // entry separator
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+// Builds tasks and bookkeeping from the USN change list instead of walking
+// the source: only entries the journal reported are visited; every other
+// database record is trusted to still exist unchanged, destination included.
+void apply_usn_changes(Job& job, const UsnChanges& ch) {
+    for (const auto& kv : job.db.files) job.seen_keys.insert(kv.first);
+
+    std::set<std::wstring> meta_parents; // dirs (rel) whose metadata to refresh
+    auto add_parent = [&](const std::wstring& rel) {
+        const size_t sep = rel.find_last_of(L'\\');
+        if (sep != std::wstring::npos) meta_parents.insert(rel.substr(0, sep));
+    };
+
+    // Delete/rename-old records only carry the final name component; match it
+    // against the database keys and let the file system confirm the loss.
+    if (!ch.removed_names.empty()) {
+        const std::set<std::wstring> gone(ch.removed_names.begin(), ch.removed_names.end());
+        for (const auto& kv : job.db.files) {
+            const std::wstring& rel = kv.first;
+            const size_t sep = rel.find_last_of(L'\\');
+            std::wstring name = rel.substr(sep == std::wstring::npos ? 0 : sep + 1);
+            for (auto& c : name) c = static_cast<wchar_t>(std::towlower(c));
+            if (!gone.contains(name)) continue;
+            if (::GetFileAttributesW(extended_path(job.src_root / rel).c_str()) !=
+                INVALID_FILE_ATTRIBUTES)
+                continue;
+            job.seen_keys.erase(rel);
+            add_parent(rel);
+        }
+    }
+
+    // The walk creates destination directories as it descends; here they must
+    // be created on demand for whatever parents a changed entry needs.
+    std::set<std::wstring> ensured;
+    auto ensure_parents = [&](const std::wstring& rel) {
+        if (!job.copying) return true;
+        for (size_t sep = rel.find(L'\\'); sep != std::wstring::npos;
+             sep = rel.find(L'\\', sep + 1)) {
+            std::wstring dir = rel.substr(0, sep);
+            std::wstring key = dir;
+            for (auto& c : key) c = static_cast<wchar_t>(std::towlower(c));
+            if (!ensured.insert(std::move(key)).second) continue;
+            std::wstring err;
+            if (!ensure_directory(job.dst_root / dir, err)) {
+                job.stats.failed.fetch_add(1, std::memory_order_relaxed);
+                log_error(err);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (const auto& e : ch.changed) {
+        // Same filters the walk applies while descending.
+        if (job.opt->mode == Mode::Drive &&
+            is_drive_system_entry(e.rel.substr(0, e.rel.find(L'\\')).c_str()))
+            continue;
+        const fs::path spath = job.src_root / e.rel;
+        const std::wstring snorm = norm_path(spath);
+        if (snorm == job.db_norm || snorm == job.db_tmp_norm) continue;
+        if (job.excl.excluded(snorm)) continue;
+        const fs::path dpath = job.dst_root / e.rel;
+        if (job.copying) {
+            const std::wstring dnorm = norm_path(dpath);
+            if (dnorm == job.db_norm || dnorm == job.db_tmp_norm) continue;
+        }
+
+        if (e.is_link) {
+            if (!ensure_parents(e.rel)) continue;
+            handle_link(job, spath, dpath, e.is_dir, e.rel);
+            add_parent(e.rel);
+        } else if (e.is_dir) {
+            if (!ensure_parents(e.rel)) continue;
+            if (job.copying) {
+                std::wstring err;
+                if (!ensure_directory(dpath, err)) {
+                    job.stats.failed.fetch_add(1, std::memory_order_relaxed);
+                    log_error(err);
+                    continue;
+                }
+            }
+            meta_parents.insert(e.rel);
+            add_parent(e.rel);
+        } else {
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            if (!::GetFileAttributesExW(extended_path(spath).c_str(), GetFileExInfoStandard,
+                                        &fad))
+                continue; // gone again since the checkpoint; its delete record
+                          // is in this batch or re-read next run
+            if (fad.dwFileAttributes &
+                (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
+                continue; // changed type after the checkpoint; the next run
+                          // re-reads that part of the journal
+            if (!ensure_parents(e.rel)) continue;
+            auto [it, inserted] = job.db.files.try_emplace(e.rel);
+            job.seen_keys.insert(e.rel);
+            job.tasks.push_back({spath, dpath, e.rel, &it->second, !inserted,
+                                 (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) |
+                                     fad.nFileSizeLow,
+                                 filetime_to_i64(fad.ftLastWriteTime), nullptr});
+            add_parent(e.rel);
+        }
+    }
+
+    if (!job.copying) return;
+
+    // A change inside a folder rewrites the folder's own write time on the
+    // source; refresh the affected directories' metadata, children first like
+    // the walk's post-order pass. Directories missing on either side (e.g.
+    // removals whose parents went with them) are silently skipped.
+    std::vector<std::wstring> ordered(meta_parents.begin(), meta_parents.end());
+    std::ranges::sort(ordered, [](const std::wstring& a, const std::wstring& b) {
+        return std::ranges::count(a, L'\\') > std::ranges::count(b, L'\\');
+    });
+    for (const auto& rel : ordered) {
+        const fs::path sdir = job.src_root / rel;
+        const DWORD sattrs = ::GetFileAttributesW(extended_path(sdir).c_str());
+        if (sattrs == INVALID_FILE_ATTRIBUTES || !(sattrs & FILE_ATTRIBUTE_DIRECTORY) ||
+            (sattrs & FILE_ATTRIBUTE_REPARSE_POINT))
+            continue;
+        const fs::path ddir = job.dst_root / rel;
+        if (::GetFileAttributesW(extended_path(ddir).c_str()) == INVALID_FILE_ATTRIBUTES)
+            continue;
+        job.dir_meta.emplace_back(sdir, ddir);
+    }
+}
+
 // "time spent: <days>d <hh>:<mm>:<ss.ss> or <total_ms>ms"
 std::wstring format_time_spent(std::chrono::milliseconds elapsed) {
     const auto total_ms = elapsed.count();
@@ -685,6 +833,45 @@ int run(const Options& opt) {
     log_info(std::format(L"database: {} ({})", job.db_file.native(),
                          had_db ? L"loaded" : L"new"));
 
+    // --ntfs-map-origin: try to serve this run from the source volume's USN
+    // change journal instead of a full source walk. Any doubt (first run,
+    // journal unreadable or wrapped, different volume, changed excludes, a
+    // --make-db refresh followed by a copy) falls back to the walk.
+    UsnJournal usn_journal;
+    UsnChanges usn_changes;
+    bool use_usn = false;
+    if (opt.ntfs_map_origin) {
+        const std::uint64_t excl_hash = excludes_fingerprint(job.excl);
+        std::wstring why;
+        if (!usn_journal.open(opt.source, why)) {
+            // Keep the stored position: it stays usable (or detectably stale)
+            // for a later run that can open the journal again.
+            log_info(L"ntfs-map-origin: full scan (" + why + L")");
+        } else {
+            if (!job.db.usn.valid)
+                why = L"no journal position in the database yet";
+            else if (job.db.usn.excludes_hash != excl_hash)
+                why = L"the exclude list changed";
+            else if (job.copying && job.db.usn.db_only)
+                why = L"the database was last refreshed with --make-db";
+            else if (usn_journal.read_changes(job.db.usn, job.src_root, usn_changes, why))
+                use_usn = true;
+
+            if (use_usn)
+                log_info(std::format(L"ntfs-map-origin: incremental, {} changed and {} "
+                                     L"removed entries reported since the last run",
+                                     usn_changes.changed.size(),
+                                     usn_changes.removed_names.size()));
+            else
+                log_info(L"ntfs-map-origin: full scan (" + why + L")");
+
+            // The checkpoint for the next run is taken before any copying, so
+            // changes racing this run are re-examined then.
+            job.db.usn = usn_journal.state();
+            job.db.usn.excludes_hash = excl_hash;
+        }
+    }
+
     const auto started = std::chrono::steady_clock::now();
 
     if (opt.mode == Mode::File) {
@@ -705,7 +892,10 @@ int run(const Options& opt) {
             }
         }
 
-        walk_dir(job, job.src_root, job.dst_root, L"", 0);
+        if (use_usn)
+            apply_usn_changes(job, usn_changes);
+        else
+            walk_dir(job, job.src_root, job.dst_root, L"", 0);
         if (job.copying && opt.move_detection) detect_moves(job);
         process_tasks(job);
 
@@ -730,6 +920,14 @@ int run(const Options& opt) {
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
                                                               started);
+
+    // A failed entry leaves a record or destination file unrefreshed that the
+    // journal position would otherwise vouch for; drop the position so the
+    // next --ntfs-map-origin run does a full scan.
+    if (job.stats.failed.load() > 0)
+        job.db.usn.valid = false;
+    else if (job.db.usn.valid)
+        job.db.usn.db_only = !job.copying;
 
     std::wstring dberr;
     bool db_saved = job.db.save(job.db_file, dberr);

@@ -58,6 +58,14 @@ Folder and drive options:
   --threads <n>          Max worker threads, 1-32 (default 8; needs --mt)
   --folder-logs          Instead of a line per file, print one line per folder
                          checked with the number of files copied from it
+  --ntfs-map-origin      Read the source volume's NTFS USN change journal to
+                         find what changed since the last run and visit only
+                         that, instead of walking the whole source tree. The
+                         journal position is kept in the database. Needs
+                         administrator rights; the first run, or any run where
+                         the journal cannot be trusted (non-NTFS source,
+                         wrapped journal, changed exclude list, a previous
+                         failed run), does a full scan automatically
 
 Notes:
   - A --drive destination may be a drive or a folder; the source drive's
@@ -161,6 +169,8 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
             opt.folder_logs = true;
         } else if (arg == L"--mt") {
             opt.multithread = true;
+        } else if (arg == L"--ntfs-map-origin") {
+            opt.ntfs_map_origin = true;
         } else if (arg == L"--threads") {
             const wchar_t* v = next_value(L"--threads");
             if (!v) return std::nullopt;
@@ -215,6 +225,10 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
         if (opt.multithread) { fail(L"--mt is only valid with --folder or --drive"); return std::nullopt; }
         if (opt.folder_logs) {
             fail(L"--folder-logs is only valid with --folder or --drive");
+            return std::nullopt;
+        }
+        if (opt.ntfs_map_origin) {
+            fail(L"--ntfs-map-origin is only valid with --folder or --drive");
             return std::nullopt;
         }
     }

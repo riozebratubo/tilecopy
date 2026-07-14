@@ -22,6 +22,7 @@ add_executable(tilecopy
   src/fsmeta.cpp
   src/reparse.cpp
   src/delta.cpp
+  src/usnmap.cpp
   src/engine.cpp
 )
 

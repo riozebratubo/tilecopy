@@ -12,7 +12,8 @@ namespace tc {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x42444354;   // "TCDB" little-endian
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 1;    // no USN journal state
+constexpr std::uint32_t kVersionUsn = 2; // + UsnState block after the header
 constexpr std::uint32_t kMaxPathBytes = 1u << 20;
 
 template <typename T>
@@ -34,14 +35,24 @@ bool ChunkDatabase::load(const std::filesystem::path& db_file, std::uint64_t exp
 
     std::uint32_t magic = 0, version = 0;
     std::uint64_t chunk_size = 0, file_count = 0;
-    if (!read_pod(in, magic) || !read_pod(in, version) ||
-        !read_pod(in, chunk_size) || !read_pod(in, file_count))
+    if (!read_pod(in, magic) || !read_pod(in, version) || !read_pod(in, chunk_size))
         return false;
-    if (magic != kMagic || version != kVersion || chunk_size != expected_chunk_size)
+    if (magic != kMagic || (version != kVersion && version != kVersionUsn) ||
+        chunk_size != expected_chunk_size)
         return false;
 
     ChunkDatabase db;
     db.chunk_size = chunk_size;
+    if (version == kVersionUsn) {
+        std::uint8_t db_only = 0;
+        if (!read_pod(in, db_only) || !read_pod(in, db.usn.volume_serial) ||
+            !read_pod(in, db.usn.journal_id) || !read_pod(in, db.usn.next_usn) ||
+            !read_pod(in, db.usn.excludes_hash))
+            return false;
+        db.usn.valid = true;
+        db.usn.db_only = db_only != 0;
+    }
+    if (!read_pod(in, file_count)) return false;
     for (std::uint64_t i = 0; i < file_count; ++i) {
         std::uint32_t path_bytes = 0;
         if (!read_pod(in, path_bytes) || path_bytes > kMaxPathBytes) return false;
@@ -79,8 +90,17 @@ bool ChunkDatabase::save(const std::filesystem::path& db_file, std::wstring& err
             return false;
         }
         write_pod(out, kMagic);
-        write_pod(out, kVersion);
+        // A database without journal state keeps the version-1 layout so
+        // older builds (and runs without --ntfs-map-origin) read it as-is.
+        write_pod(out, usn.valid ? kVersionUsn : kVersion);
         write_pod(out, chunk_size);
+        if (usn.valid) {
+            write_pod(out, static_cast<std::uint8_t>(usn.db_only ? 1 : 0));
+            write_pod(out, usn.volume_serial);
+            write_pod(out, usn.journal_id);
+            write_pod(out, usn.next_usn);
+            write_pod(out, usn.excludes_hash);
+        }
         write_pod(out, static_cast<std::uint64_t>(files.size()));
         for (const auto& [path, rec] : files) {
             const std::string path_utf8 = wide_to_utf8(path);
