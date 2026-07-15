@@ -3,6 +3,7 @@
 #include "chunkdb.h"
 #include "delta.h"
 #include "fsmeta.h"
+#include "image.h"
 #include "reparse.h"
 #include "usnmap.h"
 #include "util.h"
@@ -105,27 +106,6 @@ bool is_drive_system_entry(const wchar_t* name) {
         L"pagefile.sys", L"swapfile.sys", L"hiberfil.sys", L"DumpStack.log.tmp",
     };
     return std::ranges::any_of(kNames, [&](const wchar_t* n) { return _wcsicmp(n, name) == 0; });
-}
-
-bool check_local_drive(const fs::path& p, std::wstring& err) {
-    std::error_code ec;
-    const fs::path abs = fs::absolute(p, ec);
-    const std::wstring root = abs.root_path().native();
-    if (root.starts_with(L"\\\\")) {
-        err = std::format(L"{}: UNC/network paths are not supported", p.native());
-        return false;
-    }
-    switch (::GetDriveTypeW(root.c_str())) {
-    case DRIVE_REMOTE:
-        err = std::format(L"{}: network drives are not supported", p.native());
-        return false;
-    case DRIVE_UNKNOWN:
-    case DRIVE_NO_ROOT_DIR:
-        err = std::format(L"{}: not a valid local drive", p.native());
-        return false;
-    default:
-        return true;
-    }
 }
 
 // The database lives next to the destination (it describes what was last
@@ -741,17 +721,6 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
     }
 }
 
-// "time spent: <days>d <hh>:<mm>:<ss.ss> or <total_ms>ms"
-std::wstring format_time_spent(std::chrono::milliseconds elapsed) {
-    const auto total_ms = elapsed.count();
-    const auto days = total_ms / 86'400'000;
-    const auto hours = (total_ms / 3'600'000) % 24;
-    const auto minutes = (total_ms / 60'000) % 60;
-    const double seconds = (total_ms % 60'000) / 1000.0;
-    return std::format(L"time spent: {}d {:02}:{:02}:{:05.2f} or {}ms",
-                       days, hours, minutes, seconds, total_ms);
-}
-
 int run_single_file(Job& job) {
     const Options& opt = *job.opt;
     const DWORD sattrs = ::GetFileAttributesW(extended_path(opt.source).c_str());
@@ -786,6 +755,9 @@ int run_single_file(Job& job) {
 } // namespace
 
 int run(const Options& opt) {
+    if (opt.mode == Mode::DriveImage || opt.mode == Mode::PartitionImage)
+        return run_image(opt);
+
     std::wstring err;
     if (!check_local_drive(opt.source, err)) { log_error(err); return 1; }
     if (!opt.destination.empty() && !check_local_drive(opt.destination, err)) {
@@ -828,7 +800,7 @@ int run(const Options& opt) {
     job.db_norm = norm_path(job.db_file);
     job.db_tmp_norm = job.db_norm + L".tmp";
 
-    const bool had_db = ChunkDatabase::load(job.db_file, opt.chunk_size, job.db);
+    const bool had_db = ChunkDatabase::load(job.db_file, opt.chunk_size, false, job.db);
     job.db.chunk_size = opt.chunk_size;
     log_info(std::format(L"database: {} ({})", job.db_file.native(),
                          had_db ? L"loaded" : L"new"));

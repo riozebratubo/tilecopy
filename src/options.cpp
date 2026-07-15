@@ -2,7 +2,9 @@
 
 #include "util.h"
 
+#include <algorithm>
 #include <cwchar>
+#include <cwctype>
 #include <format>
 #include <string_view>
 
@@ -21,7 +23,10 @@ Usage:
   tilecopy --file   <source-file> <dest-file>   [options]
   tilecopy --folder <source-dir>  <dest-dir>    [options]
   tilecopy --drive  <X:>          <Y:|dest-dir> [options]
-  tilecopy --file/--folder/--drive <source> --make-db [options]
+  tilecopy --drive  <X:|N|\\.\PhysicalDriveN>   <image.vhdx> [options]
+  tilecopy --partition <X:|\\?\Volume{GUID}\|\\.\HarddiskVolumeN>
+                                  <image.vhdx> [options]
+  tilecopy --file/--folder/--drive/--partition <source> --make-db [options]
 
 Common options:
   --db <path>            Chunk-database file to use (default: next to the
@@ -66,6 +71,20 @@ Folder and drive options:
                          the journal cannot be trusted (non-NTFS source,
                          wrapped journal, changed exclude list, a previous
                          failed run), does a full scan automatically
+
+Raw image copies (--drive to a .vhdx, or --partition):
+  A .vhdx destination switches --drive to a raw sector copy of the whole
+  physical disk (a drive letter names the disk that contains that volume);
+  --partition images a single volume, wrapped in a GPT partition table so the
+  image mounts with a drive letter. Both need an elevated console. The copy
+  is taken from VSS snapshots where possible (removable drives are read
+  live), skips unallocated clusters (NTFS, FAT32, exFAT) and zeroes the
+  pagefile family. Later runs against the same database read
+  only the source and rewrite only the chunks that changed; if the .vhdx was
+  modified by anything else in between (e.g. mounted read-write) every chunk
+  is rewritten, so mount images read-only. Not valid with raw images:
+  --mirror, --no-move-detection, --exclude-*, --folder-logs,
+  --ntfs-map-origin; --chunk-size must be a multiple of 4K.
 
 Notes:
   - A --drive destination may be a drive or a folder; the source drive's
@@ -130,10 +149,17 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
         if (arg == L"--help" || arg == L"-h" || arg == L"/?") {
             print_usage();
             return std::nullopt;
-        } else if (arg == L"--file" || arg == L"--folder" || arg == L"--drive") {
-            if (mode_set) { fail(L"only one of --file/--folder/--drive is allowed"); return std::nullopt; }
+        } else if (arg == L"--file" || arg == L"--folder" || arg == L"--drive" ||
+                   arg == L"--partition") {
+            if (mode_set) {
+                fail(L"only one of --file/--folder/--drive/--partition is allowed");
+                return std::nullopt;
+            }
             mode_set = true;
-            opt.mode = arg == L"--file" ? Mode::File : arg == L"--folder" ? Mode::Folder : Mode::Drive;
+            opt.mode = arg == L"--file"     ? Mode::File
+                       : arg == L"--folder" ? Mode::Folder
+                       : arg == L"--drive"  ? Mode::Drive
+                                            : Mode::PartitionImage;
         } else if (arg == L"--db") {
             const wchar_t* v = next_value(L"--db");
             if (!v) return std::nullopt;
@@ -191,7 +217,10 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
         }
     }
 
-    if (!mode_set) { fail(L"one of --file, --folder or --drive is required"); return std::nullopt; }
+    if (!mode_set) {
+        fail(L"one of --file, --folder, --drive or --partition is required");
+        return std::nullopt;
+    }
 
     if (positional.empty()) { fail(L"a source path is required"); return std::nullopt; }
     if (positional.size() > 2) { fail(L"too many path arguments"); return std::nullopt; }
@@ -236,19 +265,109 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
     // Folder logging replaces the per-file lines.
     if (opt.folder_logs) opt.file_logs = false;
 
+    auto is_drive = [](const std::filesystem::path& p) {
+        const std::wstring& s = p.native();
+        return (s.size() == 2 || (s.size() == 3 && s[2] == L'\\')) &&
+               ((s[0] >= L'A' && s[0] <= L'Z') || (s[0] >= L'a' && s[0] <= L'z')) && s[1] == L':';
+    };
+    auto lower = [](std::wstring s) {
+        for (auto& c : s) c = static_cast<wchar_t>(std::towlower(c));
+        return s;
+    };
+    auto is_vhdx = [&](const std::filesystem::path& p) {
+        return lower(p.extension().native()) == L".vhdx";
+    };
+
     if (opt.mode == Mode::Drive) {
-        auto is_drive = [](const std::filesystem::path& p) {
-            const std::wstring& s = p.native();
-            return (s.size() == 2 || (s.size() == 3 && s[2] == L'\\')) &&
-                   ((s[0] >= L'A' && s[0] <= L'Z') || (s[0] >= L'a' && s[0] <= L'z')) && s[1] == L':';
-        };
-        if (!is_drive(opt.source)) { fail(L"--drive source must be a drive like X: or X:\\"); return std::nullopt; }
-        // Normalize to X:\ so the path is a proper root, not drive-relative.
-        opt.source = std::wstring{opt.source.native()[0], L':', L'\\'};
-        // The destination may be a drive or a folder; only a drive spec needs
-        // the same root normalization.
-        if (!opt.destination.empty() && is_drive(opt.destination))
-            opt.destination = std::wstring{opt.destination.native()[0], L':', L'\\'};
+        const std::wstring low = lower(opt.source.native());
+        const bool digits = !low.empty() && std::ranges::all_of(low, [](wchar_t c) {
+                                return c >= L'0' && c <= L'9';
+                            });
+        constexpr std::wstring_view kPhys = LR"(\\.\physicaldrive)";
+        const bool phys = low.starts_with(kPhys) || low.starts_with(LR"(\\?\physicaldrive)");
+        if (digits || phys || (!opt.destination.empty() && is_vhdx(opt.destination))) {
+            // Raw image of a whole physical disk into a .vhdx.
+            if (digits || phys) {
+                long n = 0;
+                const std::wstring num = digits ? low : low.substr(kPhys.size());
+                if (!parse_int(num.c_str(), 0, 999, n)) {
+                    fail(L"--drive disk number must be between 0 and 999");
+                    return std::nullopt;
+                }
+                opt.source = std::format(LR"(\\.\PhysicalDrive{})", n);
+            } else if (is_drive(opt.source)) {
+                opt.source = std::wstring{opt.source.native()[0], L':', L'\\'};
+            } else {
+                fail(L"--drive image source must be a drive letter, a disk number or "
+                     LR"(\\.\PhysicalDriveN)");
+                return std::nullopt;
+            }
+            if (!opt.destination.empty() && !is_vhdx(opt.destination)) {
+                fail(L"a raw disk source needs a .vhdx destination file");
+                return std::nullopt;
+            }
+            opt.mode = Mode::DriveImage;
+        } else {
+            if (!is_drive(opt.source)) {
+                fail(L"--drive source must be a drive like X: or X:\\");
+                return std::nullopt;
+            }
+            // Normalize to X:\ so the path is a proper root, not drive-relative.
+            opt.source = std::wstring{opt.source.native()[0], L':', L'\\'};
+            // The destination may be a drive or a folder; only a drive spec needs
+            // the same root normalization.
+            if (!opt.destination.empty() && is_drive(opt.destination))
+                opt.destination = std::wstring{opt.destination.native()[0], L':', L'\\'};
+        }
+    }
+
+    if (opt.mode == Mode::PartitionImage) {
+        const std::wstring low = lower(opt.source.native());
+        if (is_drive(opt.source)) {
+            opt.source = std::wstring{opt.source.native()[0], L':', L'\\'};
+        } else if (!low.starts_with(LR"(\\?\volume{)") &&
+                   !low.starts_with(LR"(\\.\harddiskvolume)")) {
+            fail(L"--partition source must be a drive letter, "
+                 LR"(\\?\Volume{GUID}\ or \\.\HarddiskVolumeN)");
+            return std::nullopt;
+        }
+        if (!opt.destination.empty() && !is_vhdx(opt.destination)) {
+            fail(L"--partition needs a .vhdx destination file");
+            return std::nullopt;
+        }
+    }
+
+    if (opt.mode == Mode::DriveImage || opt.mode == Mode::PartitionImage) {
+        const wchar_t* with =
+            opt.mode == Mode::DriveImage ? L"--drive image copies" : L"--partition";
+        if (opt.mirror) {
+            fail(std::format(L"--mirror is not valid with {}", with));
+            return std::nullopt;
+        }
+        if (!opt.move_detection || opt.move_detection_check_date) {
+            fail(std::format(L"move detection options are not valid with {}", with));
+            return std::nullopt;
+        }
+        if (!opt.exclude_files.empty() || !opt.exclude_folders.empty()) {
+            fail(std::format(L"--exclude-file/--exclude-folder are not valid with {}", with));
+            return std::nullopt;
+        }
+        if (opt.folder_logs) {
+            fail(std::format(L"--folder-logs is not valid with {}", with));
+            return std::nullopt;
+        }
+        if (opt.ntfs_map_origin) {
+            fail(std::format(L"--ntfs-map-origin is not valid with {}", with));
+            return std::nullopt;
+        }
+        if (opt.chunk_size % 4096 != 0) {
+            fail(L"--chunk-size must be a multiple of 4K for raw image copies");
+            return std::nullopt;
+        }
+        if (opt.make_db_only && opt.destination.empty() && !opt.db_path) {
+            fail(L"--make-db without a destination needs --db for raw image copies");
+            return std::nullopt;
+        }
     }
 
     return opt;

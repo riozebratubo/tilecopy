@@ -72,6 +72,37 @@ std::wstring human_bytes(unsigned long long bytes) {
     return std::format(L"{:.1f} {}", v, units[u]);
 }
 
+std::wstring format_time_spent(std::chrono::milliseconds elapsed) {
+    const auto total_ms = elapsed.count();
+    const auto days = total_ms / 86'400'000;
+    const auto hours = (total_ms / 3'600'000) % 24;
+    const auto minutes = (total_ms / 60'000) % 60;
+    const double seconds = (total_ms % 60'000) / 1000.0;
+    return std::format(L"time spent: {}d {:02}:{:02}:{:05.2f} or {}ms",
+                       days, hours, minutes, seconds, total_ms);
+}
+
+bool check_local_drive(const std::filesystem::path& p, std::wstring& err) {
+    std::error_code ec;
+    const std::filesystem::path abs = std::filesystem::absolute(p, ec);
+    const std::wstring root = abs.root_path().native();
+    if (root.starts_with(L"\\\\")) {
+        err = std::format(L"{}: UNC/network paths are not supported", p.native());
+        return false;
+    }
+    switch (::GetDriveTypeW(root.c_str())) {
+    case DRIVE_REMOTE:
+        err = std::format(L"{}: network drives are not supported", p.native());
+        return false;
+    case DRIVE_UNKNOWN:
+    case DRIVE_NO_ROOT_DIR:
+        err = std::format(L"{}: not a valid local drive", p.native());
+        return false;
+    default:
+        return true;
+    }
+}
+
 namespace {
 std::mutex g_log_mutex;
 

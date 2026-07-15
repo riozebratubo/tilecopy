@@ -9,7 +9,10 @@
 
 namespace tc {
 
-enum class Mode { File, Folder, Drive };
+// DriveImage/PartitionImage are the raw-sector modes: --drive with a disk
+// number/\\.\PhysicalDriveN source or a .vhdx destination, and --partition
+// (always an image). The source is kept as parsed; image.cpp resolves it.
+enum class Mode { File, Folder, Drive, DriveImage, PartitionImage };
 
 struct Options {
     Mode mode = Mode::File;

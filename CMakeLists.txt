@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(tilecopy VERSION 1.0.4 LANGUAGES CXX)
+project(tilecopy VERSION 1.0.5 LANGUAGES CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "tilecopy is a Windows-only tool.")
@@ -23,6 +23,9 @@ add_executable(tilecopy
   src/reparse.cpp
   src/delta.cpp
   src/usnmap.cpp
+  src/vdisk.cpp
+  src/vss.cpp
+  src/image.cpp
   src/engine.cpp
 )
 
@@ -36,4 +39,4 @@ target_compile_definitions(tilecopy PRIVATE
 
 target_compile_options(tilecopy PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
 
-target_link_libraries(tilecopy PRIVATE bcrypt advapi32)
+target_link_libraries(tilecopy PRIVATE bcrypt advapi32 virtdisk vssapi ole32)

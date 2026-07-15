@@ -6,6 +6,12 @@ first run it builds a database of SHA-256 chunk hashes (configurable chunk
 size, default 1 MiB) of the source; on later runs only the chunks that changed
 are rewritten on the destination.
 
+It can also take **raw sector images** of a whole physical disk (`--drive` to
+a `.vhdx`) or of a single partition (`--partition`), producing a dynamic VHDX
+that mounts natively in Windows (double-click, Disk Management, or
+`Mount-DiskImage`), with the same chunk database making later runs read only
+the source and rewrite only what changed.
+
 ## Build
 
 Requires Visual Studio 2022 (MSVC, C++23) and CMake 3.25+.
@@ -21,7 +27,9 @@ cmake --build build --config Release
 tilecopy --file   <source-file> <dest-file>   [options]
 tilecopy --folder <source-dir>  <dest-dir>    [options]
 tilecopy --drive  <X:>          <Y:|dest-dir> [options]
-tilecopy --file/--folder/--drive <source> --make-db [options]
+tilecopy --drive  <X:|N|\\.\PhysicalDriveN>   <image.vhdx> [options]
+tilecopy --partition <X:|\\?\Volume{GUID}\|\\.\HarddiskVolumeN> <image.vhdx> [options]
+tilecopy --file/--folder/--drive/--partition <source> --make-db [options]
 ```
 
 Common options:
@@ -47,6 +55,67 @@ Folder/drive options:
 | `--threads <n>` | Max worker threads, 1–32 (default 8; only used with `--mt`) |
 | `--folder-logs` | Instead of a line per file, print one line per folder checked with the number of files copied from it (implies `--no-file-logs`) |
 | `--ntfs-map-origin` | Read the source volume's NTFS USN change journal to visit only entries changed since the last run instead of walking the whole tree. The journal position is stored in the database; needs administrator rights. Falls back to a full scan whenever the journal cannot be trusted (see below) |
+
+## Raw image copies (`--drive` to a `.vhdx`, and `--partition`)
+
+A `.vhdx` destination switches `--drive` to a raw sector copy, and
+`--partition` always is one. Both need an **elevated console**.
+
+- **Source forms** — `--drive C:` images the whole physical disk that
+  contains volume `C:` (rejected if the volume spans disks); `--drive 0` and
+  `--drive \\.\PhysicalDrive0` name the disk directly. `--partition` takes a
+  drive letter, a volume GUID path (`\\?\Volume{...}\`, as listed by
+  `mountvol` — works for volumes without a letter, e.g. locked/encrypted
+  ones), or `\\.\HarddiskVolumeN`.
+- **Destination** — a dynamic VHDX created and attached through the Virtual
+  Disk API (1 MiB block size, sector size taken from the source disk). The
+  disk is attached outside the PnP stack (non-PnP) where Windows supports
+  it, so the image's file system can never be mounted mid-write and
+  detaching is instant; older systems fall back to a PnP attach with no
+  drive letters, kept offline — there, system services racing into the
+  image's volume can make the final detach take a while. A
+  whole-disk image carries the source's own partition table; a `--partition`
+  image wraps the volume in a generated GPT with a single basic-data
+  partition at a 1 MiB offset, so mounting it surfaces the volume with a
+  drive letter.
+- **Consistency** — every volume on the source with a mounted file system is
+  put into one VSS snapshot set (writer-involved for application
+  consistency, falling back to a writerless snapshot, then to live reads,
+  with a log line whenever it degrades). Volume data is read from the shadow
+  devices; regions without a snapshottable volume (partition gaps, boot
+  areas, unformatted or locked partitions) are read live from the raw
+  device. Removable drives cannot be snapshotted at all and are read live —
+  incremental runs still work there; a file being written during the copy is
+  simply caught by its changed hashes on the next run. An **unlocked BitLocker volume is imaged decrypted** (the copy
+  mounts as plain NTFS); a locked one is copied as raw ciphertext in full.
+- **Skipped data** — unallocated clusters (from the volume bitmap; works on
+  NTFS, FAT32 and exFAT) are neither read nor written; on the first run they
+  stay unallocated in the VHDX, keeping it small. The contents of
+  `pagefile.sys`, `hiberfil.sys` and `swapfile.sys` are stored as zeros.
+  File systems without a queryable bitmap (e.g. FAT12/16) are read in full,
+  though later runs still write only changed chunks.
+- **Incremental runs** — the database keeps one SHA-256 per chunk of the
+  source address space plus the VHDX's size and write time as recorded after
+  the previous run. When they still match, only the source is read; chunks
+  whose hash matches the record are skipped, everything else is rewritten in
+  place. **The destination is never read.** If the VHDX was modified by
+  anything else in between — including being mounted read-write — every
+  chunk is rewritten, so **mount images read-only**
+  (`Mount-DiskImage -Access ReadOnly`, or attach read-only in Disk
+  Management).
+- **Database size** — one 32-byte hash per chunk: ~32 MiB per TiB of source
+  at the default 1 MiB chunk size. Use a larger `--chunk-size` (up to 64M,
+  multiple of 4K) for very large disks.
+- `--mt`/`--threads` parallelize chunk reads/hashes/writes; `--max-tries`
+  retries failed chunk reads/writes. `--make-db` hashes the source without
+  touching any destination (needs `--db` when no destination is given). Not
+  valid: `--mirror`, move detection options, `--exclude-*`, `--folder-logs`,
+  `--ntfs-map-origin`.
+- A failed chunk (or a failed final flush) clears the recorded destination
+  state, so the next run rewrites everything rather than trusting a
+  half-updated image. Copying a system disk to a file on that same disk is
+  allowed (the snapshot keeps the copy consistent) but noisy: the image's
+  own blocks change every run.
 
 ## Behavior
 
@@ -122,3 +191,7 @@ Folder/drive options:
    layout unchanged. Any failed entry invalidates the stored position, so the
    next run walks everything instead of trusting a checkpoint that skipped a
    broken file.
+8. **Raw image databases** use a version-3 layout (source identity, the
+   VHDX's recorded size/write time, and one hash per chunk; an all-zero hash
+   marks a chunk left as a hole). Image and file databases never mix: a
+   database of the wrong flavor is discarded and rebuilt.
