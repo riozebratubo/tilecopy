@@ -195,3 +195,16 @@ A `.vhdx` destination switches `--drive` to a raw sector copy, and
    VHDX's recorded size/write time, and one hash per chunk; an all-zero hash
    marks a chunk left as a hole). Image and file databases never mix: a
    database of the wrong flavor is discarded and rebuilt.
+
+## Donations are welcome
+
+If you liked this software and would like to support its development, you can buy me a coffee. Understand that any value is fine and appreciated, and that your support means a lot to me. Thank you!
+
+[Paypal donation](https://www.paypal.com/donate/?business=NUHKNZCBCPCLQ&no_recurring=0&currency_code=USD)
+
+![Paypal qrcode](donations/paypal_qrcode.png)
+
+## Check out my other projects
+
+- [qt6appskeleton](https://github.com/riozebratubo/qt6appskeleton): a cross-platform Qt6 app skeleton with sqlite persistence and settings
+- [Winzoo](https://github.com/riozebratubo/winzoo): a lightweight taskbar replacement for Windows 10/11
