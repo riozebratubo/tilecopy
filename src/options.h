@@ -21,6 +21,9 @@ struct Options {
     std::optional<std::filesystem::path> db_path;
     bool make_db_only = false;
     std::uint64_t chunk_size = kDefaultChunkSize;
+    // Hash every source file instead of trusting size + last-write time to
+    // decide it is unchanged (raw image copies always read the source).
+    bool always_read_source = false;
 
     // folder / drive only
     bool mirror = false;

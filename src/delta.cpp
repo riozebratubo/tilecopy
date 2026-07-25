@@ -33,7 +33,7 @@ bool write_at(HANDLE h, std::uint64_t offset, const void* data, DWORD len) {
 } // namespace
 
 DeltaResult delta_copy_file(const std::filesystem::path& src, const std::filesystem::path& dst,
-                            FileRecord& record, bool had_record, bool db_only,
+                            FileRecord& record, bool had_record, bool db_only, bool always_read,
                             std::uint64_t chunk_size) {
     DeltaResult res;
     const std::wstring sext = extended_path(src);
@@ -72,9 +72,11 @@ DeltaResult delta_copy_file(const std::filesystem::path& src, const std::filesys
             !(dattrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
 
         // Fast path: source unchanged since the database was built and the
-        // destination still has the recorded size — nothing to do.
-        if (had_record && dst_is_plain_file && record.source_write_time == src_write &&
-            record.file_size == src_size) {
+        // destination still has the recorded size — nothing to do. Skipped
+        // with --always-read-source, for sources whose write time cannot be
+        // trusted (virtual disk files written through a mounter, for one).
+        if (!always_read && had_record && dst_is_plain_file &&
+            record.source_write_time == src_write && record.file_size == src_size) {
             HandleCloser hprobe{::CreateFileW(dext.c_str(), FILE_READ_ATTRIBUTES,
                                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                               OPEN_EXISTING, 0, nullptr)};

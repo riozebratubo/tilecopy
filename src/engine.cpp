@@ -306,7 +306,7 @@ bool run_task_copy(Job& job, FileTask& t) {
     DeltaResult r;
     for (int attempt = 1; attempt <= job.opt->max_tries; ++attempt) {
         r = delta_copy_file(t.src, t.dst, *t.record, t.had_record, !job.copying,
-                            job.opt->chunk_size);
+                            job.opt->always_read_source, job.opt->chunk_size);
         if (r.ok) break;
         if (attempt < job.opt->max_tries) ::Sleep(250);
     }

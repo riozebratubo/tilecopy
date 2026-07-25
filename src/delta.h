@@ -21,9 +21,11 @@ struct DeltaResult {
 // `record` (falls back to a full copy when the database and destination do
 // not line up). Always leaves `record` describing the current source content.
 // With db_only the destination is ignored and only the record is refreshed.
+// With always_read the source is hashed even when its size and write time
+// still match the record, instead of being skipped unread.
 // chunk_size must match the database the record came from.
 DeltaResult delta_copy_file(const std::filesystem::path& src, const std::filesystem::path& dst,
-                            FileRecord& record, bool had_record, bool db_only,
+                            FileRecord& record, bool had_record, bool db_only, bool always_read,
                             std::uint64_t chunk_size);
 
 } // namespace tc

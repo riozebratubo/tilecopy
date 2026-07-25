@@ -39,6 +39,7 @@ Common options:
 | `--db <path>` | Chunk-database file to use. Defaults to the destination side: `<dest-file>.tcdb`, `<dest-dir>\tilecopy.tcdb`, `Y:\tilecopy.tcdb`. With `--make-db` and no destination it is derived from the source instead |
 | `--make-db` | Only (re)generate the chunk database, copy nothing; destination may be omitted |
 | `--chunk-size <size>` | Delta chunk size, `4K`–`64M` (`K`/`M` suffixes or plain bytes, default `1M`). A database built with a different chunk size is discarded and rebuilt |
+| `--always-read-source` | Do not trust size + last-write time to decide a file is unchanged: read and hash every source file, then write only the chunks that really differ. Needed for sources whose write time is not updated when they are written — a virtual disk file modified while mounted is the usual case. Costs a full read of the source on every run. Not valid with `--ntfs-map-origin` or raw image copies |
 | `--max-tries <n>` | Attempts per file before giving up (default **1**) |
 | `--no-file-logs` | Do not print a line per file copied/moved; only the initial and final messages (and errors) are printed |
 
@@ -124,7 +125,9 @@ A `.vhdx` destination switches `--drive` to a raw sector copy, and
   file's size matches what the database recorded from the previous run;
   otherwise a full copy is performed (and the database refreshed). Files whose
   size + last-write time match the database and whose destination looks intact
-  are skipped entirely.
+  are skipped entirely — unread, so a source that changed without its write
+  time changing is missed; `--always-read-source` drops that shortcut and
+  hashes every source file instead.
 - **Move detection** (folder/drive, on by default): a database record whose
   path truly vanished from the source paired with a new source file of the
   same size whose content matches (the new file is hashed and compared to the
@@ -182,6 +185,14 @@ A `.vhdx` destination switches `--drive` to a raw sector copy, and
    tilecopy's back at equal size, the delta pass corrects any chunk whose hash
    changed **on the source** but cannot see destination-only tampering. A
    `--verify` mode reading the destination could be added later.
+   The write time is only as good as the writer: NTFS does not stamp it for
+   paging writes, so a virtual disk file written through a mounting driver can
+   change content while keeping its write time (and size) exactly as recorded,
+   and is then skipped. `--always-read-source` exists for those sources; it is
+   opt-in because the alternative is re-reading the whole source every run.
+   It is rejected together with `--ntfs-map-origin`, which decides what is
+   visited at all from the same kind of metadata, and with raw image copies,
+   which never take the shortcut in the first place.
 5. **Retries** wait 250 ms between attempts; links get the same `--max-tries`
    as files.
 6. Alternate NTFS data streams and hard-link topology are **not** preserved

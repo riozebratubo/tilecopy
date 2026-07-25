@@ -35,6 +35,12 @@ Common options:
                          --make-db is used without a destination)
   --make-db              Only (re)generate the chunk database, copy nothing;
                          the destination argument may be omitted
+  --always-read-source   Do not trust size + last-write time to decide a file
+                         is unchanged: read and hash every source file, then
+                         write only the chunks that really differ. Needed for
+                         sources whose write time is not updated when they are
+                         written, e.g. virtual disk files modified while
+                         mounted. Costs a full read of the source per run
   --chunk-size <size>    Delta chunk size, 4K-64M, K/M suffixes allowed
                          (default 1M; a database built with a different chunk
                          size is discarded and rebuilt)
@@ -84,7 +90,8 @@ Raw image copies (--drive to a .vhdx, or --partition):
   modified by anything else in between (e.g. mounted read-write) every chunk
   is rewritten, so mount images read-only. Not valid with raw images:
   --mirror, --no-move-detection, --exclude-*, --folder-logs,
-  --ntfs-map-origin; --chunk-size must be a multiple of 4K.
+  --ntfs-map-origin, --always-read-source (the source is always read in
+  full); --chunk-size must be a multiple of 4K.
 
 Notes:
   - A --drive destination may be a drive or a folder; the source drive's
@@ -166,6 +173,8 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
             opt.db_path = v;
         } else if (arg == L"--make-db") {
             opt.make_db_only = true;
+        } else if (arg == L"--always-read-source") {
+            opt.always_read_source = true;
         } else if (arg == L"--chunk-size") {
             const wchar_t* v = next_value(L"--chunk-size");
             if (!v) return std::nullopt;
@@ -237,6 +246,13 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
     }
     if (!opt.move_detection && opt.move_detection_check_date) {
         fail(L"--move-detection-check-date cannot be combined with --no-move-detection");
+        return std::nullopt;
+    }
+    // The journal decides what is visited at all, so files it does not report
+    // stay unread however little their metadata is trusted afterwards.
+    if (opt.always_read_source && opt.ntfs_map_origin) {
+        fail(L"--always-read-source cannot be combined with --ntfs-map-origin: the journal "
+             L"already decides which files are visited");
         return std::nullopt;
     }
 
@@ -358,6 +374,12 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
         }
         if (opt.ntfs_map_origin) {
             fail(std::format(L"--ntfs-map-origin is not valid with {}", with));
+            return std::nullopt;
+        }
+        if (opt.always_read_source) {
+            fail(std::format(L"--always-read-source is not valid with {}: the source is always "
+                             L"read in full",
+                             with));
             return std::nullopt;
         }
         if (opt.chunk_size % 4096 != 0) {
