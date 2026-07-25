@@ -40,7 +40,7 @@ Common options:
 | `--make-db` | Only (re)generate the chunk database, copy nothing; destination may be omitted |
 | `--chunk-size <size>` | Delta chunk size, `4K`–`64M` (`K`/`M` suffixes or plain bytes, default `1M`). A database built with a different chunk size is discarded and rebuilt |
 | `--always-read-source` | Do not trust size + last-write time to decide a file is unchanged: read and hash every source file, then write only the chunks that really differ. Needed for sources whose write time is not updated when they are written — a virtual disk file modified while mounted is the usual case. Costs a full read of the source on every run. Not valid with `--ntfs-map-origin` or raw image copies |
-| `--max-tries <n>` | Attempts per file before giving up (default **1**) |
+| `--max-tries <n>` | Attempts per file, or per chunk for raw images, before giving up (default **3**, 250 ms between attempts) |
 | `--no-file-logs` | Do not print a line per file copied/moved; only the initial and final messages (and errors) are printed |
 
 Folder/drive options:
@@ -112,11 +112,21 @@ A `.vhdx` destination switches `--drive` to a raw sector copy, and
   touching any destination (needs `--db` when no destination is given). Not
   valid: `--mirror`, move detection options, `--exclude-*`, `--folder-logs`,
   `--ntfs-map-origin`.
-- A failed chunk (or a failed final flush) clears the recorded destination
-  state, so the next run rewrites everything rather than trusting a
-  half-updated image. Copying a system disk to a file on that same disk is
-  allowed (the snapshot keeps the copy consistent) but noisy: the image's
-  own blocks change every run.
+- A failed chunk records a *failed* marker in place of its hash, so the next
+  run redoes that chunk alone and the rest of the image stays a valid
+  increment. Only a failed final flush — where which writes reached the file
+  is unknowable — clears the recorded destination state and forces a full
+  rewrite. Copying a system disk to a file on that same disk is allowed (the
+  snapshot keeps the copy consistent) but noisy: the image's own blocks
+  change every run.
+- The destination's recorded write time is one tilecopy **sets** on the
+  `.vhdx` after detaching it, not one it reads back. NTFS does not stamp a
+  write time per write for the paging I/O the virtual disk driver performs,
+  and the stamp that lands at cleanup can arrive after `DetachVirtualDisk`
+  returns — reading it back risked recording a value the file no longer had,
+  which turned every later run into a full copy. Setting it makes the value
+  tilecopy's own; it then only changes when something else writes to the
+  image, which is what the check is for.
 
 ## Behavior
 
@@ -194,7 +204,10 @@ A `.vhdx` destination switches `--drive` to a raw sector copy, and
    visited at all from the same kind of metadata, and with raw image copies,
    which never take the shortcut in the first place.
 5. **Retries** wait 250 ms between attempts; links get the same `--max-tries`
-   as files.
+   as files. The default is 3 rather than 1 because one give-up is expensive:
+   a raw image gives up on a whole chunk, and on a 4 TiB source there are four
+   million of them, so a single transient read error would otherwise be
+   near-certain on every run.
 6. Alternate NTFS data streams and hard-link topology are **not** preserved
    (only the default stream is copied).
 7. **`--ntfs-map-origin` databases** use a version-2 layout carrying the

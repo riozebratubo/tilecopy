@@ -35,11 +35,22 @@ struct UsnState {
 // zero bytes, so the value cannot collide with a real chunk hash.
 inline constexpr Sha256 kUnwrittenChunk{};
 
+// Sentinel for a raw-image chunk whose read or write failed: neither the
+// source content nor what the destination now holds is known, so the next
+// run must rewrite it whatever the source hashes to. Out of SHA-256's reach
+// for the same reason 32 zero bytes are, and distinct from a hole.
+inline constexpr Sha256 kFailedChunk{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+
 // Raw device image (--drive/--partition with a .vhdx destination): one hash
-// per chunk of the source address space (whole-disk or volume bytes). The
-// destination file's size and write time are recorded after each successful
-// run; a mismatch on the next run means the VHDX was touched by something
-// else and every chunk is rewritten.
+// per chunk of the source address space (whole-disk or volume bytes).
+// Chunks that could not be copied hold kFailedChunk so the next run redoes
+// exactly those. The destination file's size and write time are recorded
+// after each run that reached a flush; the write time is one tilecopy sets
+// itself once the image is closed, so a mismatch on the next run means the
+// VHDX really was touched by something else and every chunk is rewritten.
 struct ImageRecord {
     bool valid = false;
     std::uint8_t kind = 0; // 1 = whole disk, 2 = single partition

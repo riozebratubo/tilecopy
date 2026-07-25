@@ -892,6 +892,11 @@ void process_chunk(ImageJob& job, HANDLE base, const std::vector<HandleCloser>& 
     }
     job.ns_read.fetch_add(since(tr), std::memory_order_relaxed);
     if (!ok) {
+        // The source content is unknown, so what the destination holds for
+        // this chunk cannot be vouched for either: poison the hash and let
+        // the next run redo this chunk alone. The rest of the image stays a
+        // valid increment.
+        job.db.image.chunks[static_cast<size_t>(idx)] = kFailedChunk;
         job.failed.fetch_add(1, std::memory_order_relaxed);
         log_error(std::format(L"chunk {} (offset {}): {}", idx, c0, err));
         return;
@@ -917,6 +922,8 @@ void process_chunk(ImageJob& job, HANDLE base, const std::vector<HandleCloser>& 
         if (zero) job.bytes_zero.fetch_add(len, std::memory_order_relaxed);
         return;
     }
+    // A slot left at kFailedChunk by an earlier run matches neither test, so
+    // the chunk is rewritten here and its hash recorded for real.
     if (job.incremental) {
         if (zero && slot == kUnwrittenChunk) { // hole stays a hole
             job.bytes_zero.fetch_add(len, std::memory_order_relaxed);
@@ -944,6 +951,9 @@ void process_chunk(ImageJob& job, HANDLE base, const std::vector<HandleCloser>& 
     }
     job.ns_write.fetch_add(since(tw), std::memory_order_relaxed);
     if (!ok) {
+        // A partial write may have landed; the destination no longer matches
+        // either the old hash or the new one.
+        slot = kFailedChunk;
         job.failed.fetch_add(1, std::memory_order_relaxed);
         log_error(std::format(L"chunk {} (offset {}): write failed: {}", idx, c0,
                               win32_error_message(werr)));
@@ -1050,6 +1060,51 @@ void warn_dest_on_source(const Source& src, const fs::path& dest) {
                  L"change every run and will always be rewritten");
 }
 
+// Records the identity the next run compares the image against, and sets the
+// write time rather than reading back whatever happens to be there.
+//
+// NTFS stamps a file's write time on its own schedule - notably not once per
+// write for the paging I/O the virtual disk driver performs, and the stamp
+// that does land at cleanup can arrive after DetachVirtualDisk has returned.
+// Reading the value back at this point therefore risked recording a
+// timestamp the file no longer had moments later, which made every following
+// run see a "changed" destination and rewrite the whole image. Setting it
+// here - the image closed, nothing else writing - makes it a value tilecopy
+// owns: it stays put until something other than tilecopy writes to the file,
+// which is exactly what the check is meant to catch.
+bool stamp_destination(const fs::path& dest, ImageRecord& rec, std::wstring& error) {
+    const std::wstring ext = extended_path(dest);
+    {
+        HandleCloser h{::CreateFileW(ext.c_str(), FILE_WRITE_ATTRIBUTES,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                     OPEN_EXISTING, 0, nullptr)};
+        if (h.h == INVALID_HANDLE_VALUE) {
+            error = std::format(L"cannot open {} to stamp it: {}", dest.native(),
+                                win32_error_message(::GetLastError()));
+            return false;
+        }
+        FILETIME now{};
+        ::GetSystemTimeAsFileTime(&now);
+        if (!::SetFileTime(h.h, nullptr, nullptr, &now)) {
+            error = std::format(L"cannot set the write time of {}: {}", dest.native(),
+                                win32_error_message(::GetLastError()));
+            return false;
+        }
+    }
+    // Read back what the file system actually stored - exFAT rounds the value
+    // and the next run compares against what is on disk, not what was asked
+    // for. The handle above is closed first so this cannot see a cached one.
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!::GetFileAttributesExW(ext.c_str(), GetFileExInfoStandard, &fad)) {
+        error = std::format(L"cannot read back the state of {}: {}", dest.native(),
+                            win32_error_message(::GetLastError()));
+        return false;
+    }
+    rec.dest_size = (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    rec.dest_write_time = filetime_to_i64(fad.ftLastWriteTime);
+    return true;
+}
+
 } // namespace
 
 int run_image(const Options& opt) {
@@ -1130,15 +1185,21 @@ int run_image(const Options& opt) {
                 log_error(err);
                 return 1;
             }
+            const std::uint64_t retry = static_cast<std::uint64_t>(
+                std::ranges::count(rec.chunks, kFailedChunk));
             log_info(std::format(L"incremental: comparing {} recorded chunk hashes against "
                                  L"the source",
                                  job.chunk_count));
+            if (retry)
+                log_info(std::format(L"{} chunk(s) failed in the previous run and are redone "
+                                     L"regardless of their hash",
+                                     retry));
         } else {
             if (dest_exists) {
                 if (rec.valid && !rec.db_only) {
                     if (rec.dest_size == 0)
-                        log_info(L"the previous run did not finish cleanly; rewriting every "
-                                 L"chunk");
+                        log_info(L"the previous run could not flush or stamp the image; "
+                                 L"rewriting every chunk");
                     else
                         log_info(L"the destination changed since the last run; rewriting "
                                  L"every chunk (mount images read-only to keep increments "
@@ -1203,8 +1264,13 @@ int run_image(const Options& opt) {
         pool.reserve(workers);
         for (size_t w = 0; w < workers; ++w) pool.emplace_back([&] { image_worker(job); });
     }
-    // Workers that could not even open their devices leave chunks untouched.
-    job.failed.fetch_add(job.chunk_count - job.done.load());
+    // Workers that could not even open their devices leave the tail of the
+    // chunk list unclaimed (indexes are handed out in order); those count as
+    // failures and must not keep a stale hash either.
+    const std::uint64_t claimed = std::min(job.next.load(), job.chunk_count);
+    job.failed.fetch_add(job.chunk_count - claimed);
+    for (std::uint64_t i = claimed; i < job.chunk_count; ++i)
+        rec.chunks[static_cast<size_t>(i)] = kFailedChunk;
 
     bool flushed = true;
     double flush_s = 0.0, detach_s = 0.0;
@@ -1227,15 +1293,20 @@ int run_image(const Options& opt) {
     rec.db_only = !job.copying;
     rec.dest_size = 0;
     rec.dest_write_time = 0;
-    if (job.copying && failed == 0 && flushed) {
-        // Recorded after the detach so the next run can tell whether anything
+    // Failed chunks do not invalidate the image: each one poisoned its own
+    // hash, so the next run redoes exactly those and the rest still holds. A
+    // failed flush is different - which writes reached the file is unknown -
+    // and leaves the identity cleared, forcing a full rewrite next time.
+    if (job.copying && flushed) {
+        // Stamped after the detach so the next run can tell whether anything
         // else touched the image in between.
-        WIN32_FILE_ATTRIBUTE_DATA fad{};
-        if (::GetFileAttributesExW(extended_path(opt.destination).c_str(),
-                                   GetFileExInfoStandard, &fad)) {
-            rec.dest_size =
-                (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
-            rec.dest_write_time = filetime_to_i64(fad.ftLastWriteTime);
+        std::wstring serr;
+        if (!stamp_destination(opt.destination, rec, serr)) {
+            log_error(serr);
+            log_info(L"the destination could not be stamped; the next run will rewrite "
+                     L"every chunk");
+            rec.dest_size = 0;
+            rec.dest_write_time = 0;
         }
     }
 
@@ -1255,6 +1326,9 @@ int run_image(const Options& opt) {
             human_bytes(job.src.size), human_bytes(job.bytes_read.load()),
             human_bytes(job.bytes_zero.load()), human_bytes(job.bytes_written.load()),
             human_bytes(job.bytes_unchanged.load()), failed));
+        if (failed > 0 && flushed)
+            log_info(L"the failed chunk(s) are marked in the database; the next run redoes "
+                     L"them and keeps the rest of the image as an increment");
     }
     // Summed across workers, so with --mt the phases can exceed wall time.
     log_info(std::format(L"time breakdown: worker setup {:.1f}s, source read {:.1f}s, "

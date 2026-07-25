@@ -35,7 +35,10 @@ struct Options {
     int max_threads = 8; // 1..32
     bool ntfs_map_origin = false; // scan via the source volume's USN journal
 
-    int max_tries = 1;
+    // Retries are cheap next to what one give-up costs: a raw image gives up
+    // on a whole chunk, and a chunk that could not be copied is redone on the
+    // next run.
+    int max_tries = 3;
 
     bool file_logs = true;    // --no-file-logs (also cleared by --folder-logs)
     bool folder_logs = false; // folder / drive only

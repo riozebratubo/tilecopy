@@ -44,7 +44,8 @@ Common options:
   --chunk-size <size>    Delta chunk size, 4K-64M, K/M suffixes allowed
                          (default 1M; a database built with a different chunk
                          size is discarded and rebuilt)
-  --max-tries <n>        Attempts per file before giving up (default 1)
+  --max-tries <n>        Attempts per file, or per chunk for raw images,
+                         before giving up (default 3; 250 ms between attempts)
   --no-file-logs         Do not print a line per file copied; only the initial
                          and final messages (and errors) are printed
 
@@ -88,7 +89,9 @@ Raw image copies (--drive to a .vhdx, or --partition):
   pagefile family. Later runs against the same database read
   only the source and rewrite only the chunks that changed; if the .vhdx was
   modified by anything else in between (e.g. mounted read-write) every chunk
-  is rewritten, so mount images read-only. Not valid with raw images:
+  is rewritten, so mount images read-only. Chunks that fail are recorded as
+  failed and redone by the next run on their own, without costing the rest of
+  the increment. Not valid with raw images:
   --mirror, --no-move-detection, --exclude-*, --folder-logs,
   --ntfs-map-origin, --always-read-source (the source is always read in
   full); --chunk-size must be a multiple of 4K.

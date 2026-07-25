@@ -67,12 +67,16 @@ if ($chunkCount -ne [Math]::Floor(($sourceSize + $chunkSize - 1) / $chunkSize)) 
 }
 
 # ---- chunk census ----------------------------------------------------------
-# A chunk of 32 zero bytes is kUnwrittenChunk (a hole: source was all zeros or
-# unallocated and nothing was written to the VHDX). Everything else is a real
-# SHA-256, i.e. a chunk that holds data in the image.
+# 32 zero bytes  = kUnwrittenChunk: a hole (source all zeros or unallocated,
+#                  nothing written to the VHDX).
+# 32 x 0xFF      = kFailedChunk: the chunk's read or write failed; the next
+#                  run redoes it whatever the source hashes to.
+# anything else  = a real SHA-256, i.e. a chunk that holds data in the image.
 if (-not $NoChunkScan -and $chunkCount -gt 0) {
-    $holes = [UInt64]0
-    $data  = [UInt64]0
+    $holes  = [UInt64]0
+    $data   = [UInt64]0
+    $failed = [UInt64]0
+    $ones = [UInt64]::MaxValue
     $blockChunks = 262144                       # 8 MiB of hashes per read
     $left = [UInt64]$chunkCount
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -81,23 +85,27 @@ if (-not $NoChunkScan -and $chunkCount -gt 0) {
         $buf = $br.ReadBytes($n * 32)
         if ($buf.Length -ne $n * 32) { "WARNING: database is truncated; scanned what was there."; $left = 0; break }
         for ($i = 0; $i -lt $buf.Length; $i += 32) {
-            # first 8 bytes non-zero => certainly a real hash; the full check
-            # only runs on the ~1-in-2^64 case and on true holes.
-            if ([BitConverter]::ToUInt64($buf, $i) -ne 0) { $data++; continue }
-            $zero = $true
+            # The first 8 bytes decide it except in the ~1-in-2^64 case, where
+            # the remaining 24 are checked before claiming a sentinel.
+            $head = [BitConverter]::ToUInt64($buf, $i)
+            if ($head -ne 0 -and $head -ne $ones) { $data++; continue }
+            $same = $true
             for ($k = $i + 8; $k -lt $i + 32; $k += 8) {
-                if ([BitConverter]::ToUInt64($buf, $k) -ne 0) { $zero = $false; break }
+                if ([BitConverter]::ToUInt64($buf, $k) -ne $head) { $same = $false; break }
             }
-            if ($zero) { $holes++ } else { $data++ }
+            if (-not $same) { $data++ }
+            elseif ($head -eq 0) { $holes++ }
+            else { $failed++ }
         }
         $left -= [UInt64]$n
     }
     $sw.Stop()
-    "chunks with data: $data  ($(Human ([UInt64]($data * $chunkSize))))"
-    "chunks as holes : $holes  ($(Human ([UInt64]($holes * $chunkSize))))"
-    "                  (scanned in $([int]$sw.Elapsed.TotalSeconds)s)"
-    "                  a full (non-incremental) run rewrites the 'with data' figure;"
-    "                  compare it against what the run reported as written."
+    "chunks with data  : $data  ($(Human ([UInt64]($data * $chunkSize))))"
+    "chunks as holes   : $holes  ($(Human ([UInt64]($holes * $chunkSize))))"
+    "chunks marked bad : $failed  ($(Human ([UInt64]($failed * $chunkSize))))  <- redone by the next run"
+    "                    (scanned in $([int]$sw.Elapsed.TotalSeconds)s)"
+    "                    a full (non-incremental) run rewrites the 'with data' figure;"
+    "                    compare it against what the run reported as written."
     ""
 }
 $br.Close(); $fs.Close()
@@ -117,12 +125,15 @@ $actualWt   = $f.LastWriteTimeUtc.ToFileTimeUtc()
 ""
 
 $reasons = @()
+$timestampRace = $false
 if ($dbOnly -ne 0)          { $reasons += "the database was written by --make-db (db_only=1)" }
-if ($destSize -eq 0)        { $reasons += "dest_size is 0: the recorded run had failed chunk(s) or a failed flush, so tilecopy discarded the destination identity" }
+if ($destSize -eq 0)        { $reasons += "dest_size is 0: the recorded run could not flush or could not stamp the image, so tilecopy discarded the destination identity" }
 elseif ($destSize -ne $actualSize) { $reasons += "size differs: recorded $destSize, actual $actualSize" }
 if ($destWt -ne $actualWt -and $destSize -ne 0) {
     $delta = $actualWt - $destWt
-    $reasons += ("write time differs: recorded $destWt, actual $actualWt (actual is {0:N3}s {1})" -f ([Math]::Abs($delta) / 1e7), $(if ($delta -gt 0) { 'newer' } else { 'older' }))
+    $secs = [Math]::Abs($delta) / 1e7
+    $reasons += ("write time differs: recorded $destWt, actual $actualWt (actual is {0:N3}s {1})" -f $secs, $(if ($delta -gt 0) { 'newer' } else { 'older' }))
+    if ($delta -gt 0 -and $secs -lt 60) { $timestampRace = $true }
 }
 
 if ($reasons.Count -eq 0) {
@@ -130,8 +141,12 @@ if ($reasons.Count -eq 0) {
 } else {
     "VERDICT: the next run DELETES the .vhdx and rewrites every chunk that holds data."
     foreach ($r in $reasons) { "  - $r" }
-    ""
-    "A write time that is only a fraction of a second newer than the recorded one means"
-    "NTFS stamped the VHDX after tilecopy read the timestamp back (post-detach cleanup),"
-    "which makes every run a full copy no matter how little the source changed."
+    if ($timestampRace) {
+        ""
+        "The actual write time is only slightly newer than the recorded one, which is the"
+        "signature of the pre-fix behaviour: NTFS stamped the VHDX after tilecopy had read"
+        "the timestamp back, so every run turned into a full copy. Builds that set the"
+        "stamp themselves after detaching do not do this. One more full copy with a fixed"
+        "build re-establishes the identity, and later runs stay incremental."
+    }
 }
