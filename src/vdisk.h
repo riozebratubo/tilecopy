@@ -25,20 +25,23 @@ public:
     bool create(const std::filesystem::path& file, std::uint64_t virtual_size,
                 std::uint32_t sector_size, std::wstring& error);
 
-    // Opens an existing VHDX read/write.
-    bool open(const std::filesystem::path& file, std::wstring& error);
+    // Opens an existing VHDX. read_only carries through to the attach and to
+    // every handle opened on the attached disk, so restoring from an image
+    // cannot modify it even if something goes wrong.
+    bool open(const std::filesystem::path& file, std::wstring& error, bool read_only = false);
 
     // Attaches (non-PnP first, PnP fallback), waits for the disk device and
-    // opens a raw read/write handle on it.
+    // opens a raw handle on it.
     bool attach(std::wstring& error);
 
     // Raw disk HANDLE valid after attach() (owned by this object).
     void* handle() const { return disk_; }
     const std::wstring& physical_path() const { return phys_path_; }
+    bool read_only() const { return read_only_; }
 
     // Opens an additional raw handle on the attached disk for per-thread I/O.
     // Returns INVALID_HANDLE_VALUE on failure; the caller closes it.
-    void* open_raw(std::wstring& error) const;
+    void* open_raw(std::wstring& error, unsigned long flags = 0) const;
 
     bool flush(std::wstring& error);
     void detach();
@@ -48,6 +51,7 @@ private:
 
     void* vhd_ = nullptr;  // virtdisk HANDLE
     void* disk_ = nullptr; // raw disk device HANDLE
+    bool read_only_ = false;
     std::wstring phys_path_;
 };
 

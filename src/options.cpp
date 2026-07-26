@@ -26,13 +26,16 @@ Usage:
   tilecopy --drive  <X:|N|\\.\PhysicalDriveN>   <image.vhdx> [options]
   tilecopy --partition <X:|\\?\Volume{GUID}\|\\.\HarddiskVolumeN>
                                   <image.vhdx> [options]
+  tilecopy --restore <image.vhdx> <N|\\.\PhysicalDriveN|X:>        [options]
+  tilecopy --restore <image.vhdx> <X:|\\?\Volume{GUID}\|\\.\HarddiskVolumeN>
   tilecopy --file/--folder/--drive/--partition <source> --make-db [options]
 
 Common options:
   --db <path>            Chunk-database file to use (default: next to the
                          destination: <dest-file>.tcdb, <dest-dir>\tilecopy.tcdb,
                          Y:\tilecopy.tcdb; derived from the source when
-                         --make-db is used without a destination)
+                         --make-db is used without a destination, or
+                         <image.vhdx>.tcdb when restoring)
   --make-db              Only (re)generate the chunk database, copy nothing;
                          the destination argument may be omitted
   --always-read-source   Do not trust size + last-write time to decide a file
@@ -95,6 +98,33 @@ Raw image copies (--drive to a .vhdx, or --partition):
   --mirror, --no-move-detection, --exclude-*, --folder-logs,
   --ntfs-map-origin, --always-read-source (the source is always read in
   full); --chunk-size must be a multiple of 4K.
+
+Restoring an image (--restore):
+  Writes a .vhdx made by --drive or --partition back onto real hardware,
+  overwriting everything on the target. The image is attached read-only, so a
+  restore can never modify it. What the image holds decides what the target
+  must be: a whole-disk image goes to a physical disk (a drive letter names
+  the disk that contains that volume), a --partition image goes to a single
+  volume, which is locked and dismounted for the duration. The target must be
+  at least as large as the imaged device; extra space past the image is left
+  untouched. Needs an elevated console. The target disk is taken offline for
+  the run and brought back afterwards; a disk holding the running Windows
+  installation, or the image file itself, is refused.
+  By default each chunk is compared against the target and written only when
+  it differs, so restoring onto a drive that is already close to the image
+  moves very little data. If a chunk database for the image is found (see
+  --db; it must have been written with the same --chunk-size), every chunk
+  read from the image is checked against its recorded hash and mismatches are
+  reported as image corruption.
+  --yes                  Do not ask for confirmation before overwriting the
+                         target (required when stdin is not a console)
+  --restore-write-all    Write every chunk without reading the target first.
+                         Skips the compare pass, so nothing is read from the
+                         target and every byte of the image is written
+  Also valid with --restore: --db, --chunk-size, --max-tries, --mt,
+  --threads, --no-file-logs. Not valid: --make-db, --mirror, move detection
+  options, --exclude-*, --folder-logs, --ntfs-map-origin,
+  --always-read-source.
 
 Notes:
   - A --drive destination may be a drive or a folder; the source drive's
@@ -160,16 +190,17 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
             print_usage();
             return std::nullopt;
         } else if (arg == L"--file" || arg == L"--folder" || arg == L"--drive" ||
-                   arg == L"--partition") {
+                   arg == L"--partition" || arg == L"--restore") {
             if (mode_set) {
-                fail(L"only one of --file/--folder/--drive/--partition is allowed");
+                fail(L"only one of --file/--folder/--drive/--partition/--restore is allowed");
                 return std::nullopt;
             }
             mode_set = true;
-            opt.mode = arg == L"--file"     ? Mode::File
-                       : arg == L"--folder" ? Mode::Folder
-                       : arg == L"--drive"  ? Mode::Drive
-                                            : Mode::PartitionImage;
+            opt.mode = arg == L"--file"      ? Mode::File
+                       : arg == L"--folder"  ? Mode::Folder
+                       : arg == L"--drive"   ? Mode::Drive
+                       : arg == L"--restore" ? Mode::Restore
+                                             : Mode::PartitionImage;
         } else if (arg == L"--db") {
             const wchar_t* v = next_value(L"--db");
             if (!v) return std::nullopt;
@@ -178,6 +209,10 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
             opt.make_db_only = true;
         } else if (arg == L"--always-read-source") {
             opt.always_read_source = true;
+        } else if (arg == L"--yes") {
+            opt.assume_yes = true;
+        } else if (arg == L"--restore-write-all") {
+            opt.restore_write_all = true;
         } else if (arg == L"--chunk-size") {
             const wchar_t* v = next_value(L"--chunk-size");
             if (!v) return std::nullopt;
@@ -230,7 +265,7 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
     }
 
     if (!mode_set) {
-        fail(L"one of --file, --folder, --drive or --partition is required");
+        fail(L"one of --file, --folder, --drive, --partition or --restore is required");
         return std::nullopt;
     }
 
@@ -256,6 +291,10 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
     if (opt.always_read_source && opt.ntfs_map_origin) {
         fail(L"--always-read-source cannot be combined with --ntfs-map-origin: the journal "
              L"already decides which files are visited");
+        return std::nullopt;
+    }
+    if ((opt.assume_yes || opt.restore_write_all) && opt.mode != Mode::Restore) {
+        fail(L"--yes and --restore-write-all are only valid with --restore");
         return std::nullopt;
     }
 
@@ -352,6 +391,56 @@ std::optional<Options> parse_command_line(int argc, wchar_t** argv) {
         }
         if (!opt.destination.empty() && !is_vhdx(opt.destination)) {
             fail(L"--partition needs a .vhdx destination file");
+            return std::nullopt;
+        }
+    }
+
+    if (opt.mode == Mode::Restore) {
+        if (opt.make_db_only) {
+            fail(L"--make-db is not valid with --restore");
+            return std::nullopt;
+        }
+        if (opt.mirror || !opt.move_detection || opt.move_detection_check_date ||
+            !opt.exclude_files.empty() || !opt.exclude_folders.empty() || opt.folder_logs ||
+            opt.ntfs_map_origin || opt.always_read_source) {
+            fail(L"--mirror, move detection options, --exclude-*, --folder-logs, "
+                 L"--ntfs-map-origin and --always-read-source are not valid with --restore");
+            return std::nullopt;
+        }
+        if (opt.chunk_size % 4096 != 0) {
+            fail(L"--chunk-size must be a multiple of 4K with --restore");
+            return std::nullopt;
+        }
+        if (!is_vhdx(opt.source)) {
+            fail(L"--restore needs a .vhdx image file as its first path argument");
+            return std::nullopt;
+        }
+        // Which of these the image actually needs is only known once the image
+        // has been read, so every target spelling is accepted here and matched
+        // against the image kind later.
+        const std::wstring low = lower(opt.destination.native());
+        const bool digits = !low.empty() && std::ranges::all_of(low, [](wchar_t c) {
+                                return c >= L'0' && c <= L'9';
+                            });
+        constexpr std::wstring_view kPhys = LR"(\\.\physicaldrive)";
+        const bool phys = low.starts_with(kPhys) || low.starts_with(LR"(\\?\physicaldrive)");
+        if (digits || phys) {
+            long n = 0;
+            const std::wstring num = digits ? low : low.substr(kPhys.size());
+            if (!parse_int(num.c_str(), 0, 999, n)) {
+                fail(L"--restore target disk number must be between 0 and 999");
+                return std::nullopt;
+            }
+            opt.destination = std::format(LR"(\\.\PhysicalDrive{})", n);
+        } else if (is_drive(opt.destination)) {
+            opt.destination = std::wstring{opt.destination.native()[0], L':', L'\\'};
+        } else if (low.starts_with(LR"(\\?\volume{)")) {
+            std::wstring name = opt.destination.native();
+            if (name.back() != L'\\') name += L'\\';
+            opt.destination = name;
+        } else if (!low.starts_with(LR"(\\.\harddiskvolume)")) {
+            fail(LR"(--restore target must be a disk (N or \\.\PhysicalDriveN), a drive letter, )"
+                 LR"(\\?\Volume{GUID}\ or \\.\HarddiskVolumeN)");
             return std::nullopt;
         }
     }

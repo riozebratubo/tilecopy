@@ -10,7 +10,8 @@ It can also take **raw sector images** of a whole physical disk (`--drive` to
 a `.vhdx`) or of a single partition (`--partition`), producing a dynamic VHDX
 that mounts natively in Windows (double-click, Disk Management, or
 `Mount-DiskImage`), with the same chunk database making later runs read only
-the source and rewrite only what changed.
+the source and rewrite only what changed. Those images go back onto real
+hardware with `--restore`.
 
 ## Build
 
@@ -29,6 +30,8 @@ tilecopy --folder <source-dir>  <dest-dir>    [options]
 tilecopy --drive  <X:>          <Y:|dest-dir> [options]
 tilecopy --drive  <X:|N|\\.\PhysicalDriveN>   <image.vhdx> [options]
 tilecopy --partition <X:|\\?\Volume{GUID}\|\\.\HarddiskVolumeN> <image.vhdx> [options]
+tilecopy --restore <image.vhdx> <N|\\.\PhysicalDriveN|X:> [options]
+tilecopy --restore <image.vhdx> <X:|\\?\Volume{GUID}\|\\.\HarddiskVolumeN> [options]
 tilecopy --file/--folder/--drive/--partition <source> --make-db [options]
 ```
 
@@ -36,7 +39,7 @@ Common options:
 
 | Option | Meaning |
 |---|---|
-| `--db <path>` | Chunk-database file to use. Defaults to the destination side: `<dest-file>.tcdb`, `<dest-dir>\tilecopy.tcdb`, `Y:\tilecopy.tcdb`. With `--make-db` and no destination it is derived from the source instead |
+| `--db <path>` | Chunk-database file to use. Defaults to the destination side: `<dest-file>.tcdb`, `<dest-dir>\tilecopy.tcdb`, `Y:\tilecopy.tcdb`. With `--make-db` and no destination it is derived from the source instead; with `--restore` it defaults to `<image.vhdx>.tcdb` and is only read |
 | `--make-db` | Only (re)generate the chunk database, copy nothing; destination may be omitted |
 | `--chunk-size <size>` | Delta chunk size, `4K`–`64M` (`K`/`M` suffixes or plain bytes, default `1M`). A database built with a different chunk size is discarded and rebuilt |
 | `--always-read-source` | Do not trust size + last-write time to decide a file is unchanged: read and hash every source file, then write only the chunks that really differ. Needed for sources whose write time is not updated when they are written — a virtual disk file modified while mounted is the usual case. Costs a full read of the source on every run. Not valid with `--ntfs-map-origin` or raw image copies |
@@ -128,6 +131,67 @@ A `.vhdx` destination switches `--drive` to a raw sector copy, and
   tilecopy's own; it then only changes when something else writes to the
   image, which is what the check is for.
 
+## Restoring an image (`--restore`)
+
+Writes a `.vhdx` made by `--drive` or `--partition` back onto real hardware,
+**overwriting everything on the target**. Needs an **elevated console**.
+
+```
+tilecopy --restore E:\backups\disk0.vhdx 2          # onto \\.\PhysicalDrive2
+tilecopy --restore E:\backups\data.vhdx  D:         # a volume image onto D:
+```
+
+| Option | Meaning |
+|---|---|
+| `--yes` | Do not ask for confirmation before overwriting the target. Required when stdin is not a console |
+| `--restore-write-all` | Write every chunk without reading the target first. Skips the compare pass entirely |
+
+- **The image is attached read-only** (read-only open *and* read-only attach),
+  so a restore can never modify the backup it reads.
+- **What the image is decides what the target must be.** A whole-disk image
+  goes onto a physical disk (`2`, `\\.\PhysicalDrive2`, or a drive letter
+  naming the disk that holds that volume); a `--partition` image goes onto a
+  single volume (drive letter, `\\?\Volume{...}\`, `\\.\HarddiskVolumeN`).
+  Naming the wrong kind is an error, not a guess. The two are told apart by
+  the GPT wrapper `--partition` writes (one basic-data entry named `tilecopy`
+  at a 1 MiB offset); a chunk database that describes the image overrides that
+  probe, and one that does not is ignored.
+- **Delta restore by default** — each chunk is read from the image, compared
+  against the same chunk on the target, and written only if it differs. So
+  re-restoring onto a drive that is already close to the image moves very
+  little data. `--restore-write-all` writes everything instead.
+- **Verification** — if a chunk database for the image is found
+  (`<image.vhdx>.tcdb`, or `--db`, written with the same `--chunk-size`), every
+  chunk read out of the image is hashed and checked against the hash recorded
+  when the backup was taken. Mismatches are reported and still written (the
+  image is all there is), and the run exits with code 2 so a damaged image
+  cannot pass silently. The database is only ever read here, never written.
+- **The target must be at least as large** as the device the image was made
+  from. Extra space past the image is left untouched; for a GPT whole-disk
+  image on a larger disk that means the backup GPT header lands where the
+  original disk ended, so Windows will offer to repair the partition table
+  afterwards. A sector-size difference between the image's device and the
+  target is reported too — partition tables and file systems inside the image
+  assume the original size.
+- **Refusals** — a target holding the running Windows installation, or the
+  image file itself, is rejected outright. If the chunk database happens to
+  live on the target, that is reported as a warning (it is not needed to
+  restore).
+- **Confirmation** — the image, the target device (model, size, current
+  partition table and volumes with labels) and every warning are printed
+  first, then the disk number (or drive letter) has to be typed back. `--yes`
+  skips the prompt.
+- **Taking the target** — volumes on a target disk are locked and dismounted
+  and the disk is taken offline for the run (non-persistently), then brought
+  back online with a properties refresh so Windows re-reads the restored
+  layout. A volume target must be lockable: writing a file system's own
+  metadata under a live mount corrupts it, so an unlockable volume stops the
+  restore before anything is written.
+- `--mt`/`--threads` parallelize image reads, hashing and comparing;
+  `--max-tries` retries a failed chunk read or write. A chunk that still fails
+  leaves that region of the target holding whatever it had — the run reports
+  it and exits with code 2; run the restore again.
+
 ## Behavior
 
 - **Delta copy**: a file is rewritten chunk-by-chunk only where the chunk hash
@@ -177,8 +241,9 @@ A `.vhdx` destination switches `--drive` to a raw sector copy, and
   incremental runs.
 - Only local drives (fixed/removable) are supported; UNC paths and mapped
   network drives are rejected.
-- Exit codes: `0` success, `1` bad arguments/setup, `2` completed with
-  failures (or the database could not be saved).
+- Exit codes: `0` success, `1` bad arguments/setup (or a declined `--restore`
+  confirmation), `2` completed with failures (or the database could not be
+  saved; for `--restore`, also a chunk that did not match its recorded hash).
 
 ## Design decisions
 
@@ -219,6 +284,14 @@ A `.vhdx` destination switches `--drive` to a raw sector copy, and
    VHDX's recorded size/write time, and one hash per chunk; an all-zero hash
    marks a chunk left as a hole). Image and file databases never mix: a
    database of the wrong flavor is discarded and rebuilt.
+9. **`--restore` is a mode, not a direction flag**: it takes the image and the
+   target positionally like every other mode, and refuses to guess what the
+   image is. Restoring compares the target before writing because the delta
+   idea holds in that direction too — a spare drive kept in sync with an image
+   is mostly identical to it already — and because reading a target that is
+   about to be overwritten costs nothing but time. The database is optional
+   there: it is what makes a corrupted image detectable during the restore,
+   but nothing about restoring depends on having it.
 
 ## Donations are welcome
 

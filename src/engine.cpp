@@ -5,6 +5,7 @@
 #include "fsmeta.h"
 #include "image.h"
 #include "reparse.h"
+#include "restore.h"
 #include "usnmap.h"
 #include "util.h"
 
@@ -757,6 +758,7 @@ int run_single_file(Job& job) {
 int run(const Options& opt) {
     if (opt.mode == Mode::DriveImage || opt.mode == Mode::PartitionImage)
         return run_image(opt);
+    if (opt.mode == Mode::Restore) return run_restore(opt);
 
     std::wstring err;
     if (!check_local_drive(opt.source, err)) { log_error(err); return 1; }

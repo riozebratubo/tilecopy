@@ -44,13 +44,13 @@ bool VhdxDisk::create(const std::filesystem::path& file, std::uint64_t virtual_s
     return true;
 }
 
-bool VhdxDisk::open(const std::filesystem::path& file, std::wstring& error) {
+bool VhdxDisk::open(const std::filesystem::path& file, std::wstring& error, bool read_only) {
     VIRTUAL_STORAGE_TYPE stype{VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
                                VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT};
     OPEN_VIRTUAL_DISK_PARAMETERS params{};
     params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
     params.Version2.GetInfoOnly = FALSE;
-    params.Version2.ReadOnly = FALSE;
+    params.Version2.ReadOnly = read_only ? TRUE : FALSE;
 
     HANDLE h = INVALID_HANDLE_VALUE;
     const DWORD rc = ::OpenVirtualDisk(&stype, file.c_str(), VIRTUAL_DISK_ACCESS_NONE,
@@ -58,6 +58,7 @@ bool VhdxDisk::open(const std::filesystem::path& file, std::wstring& error) {
     if (rc != ERROR_SUCCESS)
         return fail(error, std::format(L"cannot open {}", file.native()), rc);
     vhd_ = h;
+    read_only_ = read_only;
     return true;
 }
 
@@ -68,8 +69,11 @@ bool VhdxDisk::try_attach(bool non_pnp, std::wstring& error) {
 
     ATTACH_VIRTUAL_DISK_PARAMETERS params{};
     params.Version = ATTACH_VIRTUAL_DISK_VERSION_1;
-    const ATTACH_VIRTUAL_DISK_FLAG flags =
+    ATTACH_VIRTUAL_DISK_FLAG flags =
         non_pnp ? kNonPnp : ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER;
+    if (read_only_)
+        flags = static_cast<ATTACH_VIRTUAL_DISK_FLAG>(flags |
+                                                     ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY);
     const DWORD rc = ::AttachVirtualDisk(vhd_, nullptr, flags, 0, &params, nullptr);
     if (rc != ERROR_SUCCESS) return fail(error, L"cannot attach virtual disk", rc);
     const auto undo = [&] {
@@ -88,10 +92,10 @@ bool VhdxDisk::try_attach(bool non_pnp, std::wstring& error) {
 
     // The disk device can take a moment to accept opens after attach.
     HANDLE h = INVALID_HANDLE_VALUE;
+    const DWORD access = read_only_ ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
     for (int attempt = 0; attempt < (non_pnp ? 20 : 100); ++attempt) {
-        h = ::CreateFileW(phys_path_.c_str(), GENERIC_READ | GENERIC_WRITE,
-                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
-                          nullptr);
+        h = ::CreateFileW(phys_path_.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          nullptr, OPEN_EXISTING, 0, nullptr);
         if (h != INVALID_HANDLE_VALUE) break;
         ::Sleep(100);
     }
@@ -118,11 +122,16 @@ bool VhdxDisk::try_attach(bool non_pnp, std::wstring& error) {
     DWORD br = 0;
     if (!::DeviceIoControl(disk_, IOCTL_DISK_SET_DISK_ATTRIBUTES, &attrs, sizeof(attrs),
                            nullptr, 0, &br, nullptr)) {
-        fail(error, L"cannot take the attached disk offline", ::GetLastError());
-        ::CloseHandle(disk_);
-        disk_ = nullptr;
-        undo();
-        return false;
+        // Only writers need the exclusivity: a read-only attach cannot damage
+        // the image whatever else mounts it, so an offline refusal (the usual
+        // reason being the read-only attach itself) is not fatal there.
+        if (!read_only_) {
+            fail(error, L"cannot take the attached disk offline", ::GetLastError());
+            ::CloseHandle(disk_);
+            disk_ = nullptr;
+            undo();
+            return false;
+        }
     }
     ::DeviceIoControl(disk_, IOCTL_DISK_UPDATE_PROPERTIES, nullptr, 0, nullptr, 0, &br,
                       nullptr);
@@ -145,9 +154,10 @@ bool VhdxDisk::attach(std::wstring& error) {
     return try_attach(false, error);
 }
 
-void* VhdxDisk::open_raw(std::wstring& error) const {
-    HANDLE h = ::CreateFileW(phys_path_.c_str(), GENERIC_READ | GENERIC_WRITE,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+void* VhdxDisk::open_raw(std::wstring& error, unsigned long flags) const {
+    HANDLE h = ::CreateFileW(phys_path_.c_str(),
+                             read_only_ ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE),
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, flags,
                              nullptr);
     if (h == INVALID_HANDLE_VALUE)
         fail(error, std::format(L"cannot open attached disk {}", phys_path_),
@@ -171,6 +181,7 @@ void VhdxDisk::detach() {
         ::CloseHandle(vhd_);
         vhd_ = nullptr;
     }
+    read_only_ = false;
     phys_path_.clear();
 }
 

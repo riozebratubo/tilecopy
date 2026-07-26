@@ -12,7 +12,9 @@ namespace tc {
 // DriveImage/PartitionImage are the raw-sector modes: --drive with a disk
 // number/\\.\PhysicalDriveN source or a .vhdx destination, and --partition
 // (always an image). The source is kept as parsed; image.cpp resolves it.
-enum class Mode { File, Folder, Drive, DriveImage, PartitionImage };
+// Restore is those two run backwards: a .vhdx image written back onto a
+// physical disk or a volume, resolved by restore.cpp.
+enum class Mode { File, Folder, Drive, DriveImage, PartitionImage, Restore };
 
 struct Options {
     Mode mode = Mode::File;
@@ -34,6 +36,10 @@ struct Options {
     bool multithread = false;
     int max_threads = 8; // 1..32
     bool ntfs_map_origin = false; // scan via the source volume's USN journal
+
+    // restore only
+    bool assume_yes = false;        // --yes: skip the "this erases the target" prompt
+    bool restore_write_all = false; // --restore-write-all: do not compare the target first
 
     // Retries are cheap next to what one give-up costs: a raw image gives up
     // on a whole chunk, and a chunk that could not be copied is redone on the

@@ -1,6 +1,8 @@
 #include "image.h"
 
 #include "chunkdb.h"
+#include "devio.h"
+#include "gpt.h"
 #include "hash.h"
 #include "util.h"
 #include "vdisk.h"
@@ -30,61 +32,9 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::uint64_t kMiB = 1ull << 20;
-// Where the volume data starts inside a --partition image: one aligned MiB
-// leaves room for the protective MBR, the GPT header and its entry array.
-constexpr std::uint64_t kPartitionDataOffset = kMiB;
-constexpr std::uint64_t kGptEntryBytes = 128ull * 128; // 128 entries of 128 bytes
 // Allocated runs closer than this are read as one device I/O; the gap bytes
 // are zeroed afterwards anyway.
 constexpr std::uint64_t kReadMergeGap = 128ull * 1024;
-
-struct HandleCloser {
-    HANDLE h = INVALID_HANDLE_VALUE;
-    HandleCloser() = default;
-    explicit HandleCloser(HANDLE hh) : h(hh) {}
-    HandleCloser(const HandleCloser&) = delete;
-    HandleCloser& operator=(const HandleCloser&) = delete;
-    HandleCloser(HandleCloser&& o) noexcept : h(std::exchange(o.h, INVALID_HANDLE_VALUE)) {}
-    HandleCloser& operator=(HandleCloser&& o) noexcept {
-        if (this != &o) {
-            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
-            h = std::exchange(o.h, INVALID_HANDLE_VALUE);
-        }
-        return *this;
-    }
-    ~HandleCloser() {
-        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
-    }
-};
-
-bool read_at(HANDLE h, std::uint64_t off, void* p, DWORD len) {
-    OVERLAPPED o{};
-    o.Offset = static_cast<DWORD>(off);
-    o.OffsetHigh = static_cast<DWORD>(off >> 32);
-    DWORD got = 0;
-    return ::ReadFile(h, p, len, &got, &o) && got == len;
-}
-
-bool write_at(HANDLE h, std::uint64_t off, const void* p, DWORD len) {
-    OVERLAPPED o{};
-    o.Offset = static_cast<DWORD>(off);
-    o.OffsetHigh = static_cast<DWORD>(off >> 32);
-    DWORD written = 0;
-    return ::WriteFile(h, p, len, &written, &o) && written == len;
-}
-
-bool is_elevated() {
-    HANDLE tok = nullptr;
-    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
-    TOKEN_ELEVATION te{};
-    DWORD rl = 0;
-    const bool ok =
-        ::GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &rl) && te.TokenIsElevated;
-    ::CloseHandle(tok);
-    return ok;
-}
-
-std::uint64_t round_up(std::uint64_t v, std::uint64_t a) { return (v + a - 1) / a * a; }
 
 struct ZeroRun {
     std::uint64_t off = 0, len = 0; // volume-relative bytes, forced to zero
@@ -119,74 +69,6 @@ struct Source {
     std::vector<VolumeInfo> volumes; // sorted by src_offset
 };
 
-HANDLE open_device(const std::wstring& dev, DWORD access, std::wstring& error,
-                   DWORD flags = 0) {
-    HANDLE h = ::CreateFileW(dev.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                             OPEN_EXISTING, flags, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        error = std::format(L"cannot open {}: {}", dev, win32_error_message(::GetLastError()));
-    return h;
-}
-
-// Page-aligned buffer: FILE_FLAG_NO_BUFFERING needs sector-aligned memory.
-struct AlignedBuf {
-    std::uint8_t* p = nullptr;
-    explicit AlignedBuf(std::size_t n) {
-        p = static_cast<std::uint8_t*>(
-            ::VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    }
-    AlignedBuf(const AlignedBuf&) = delete;
-    AlignedBuf& operator=(const AlignedBuf&) = delete;
-    ~AlignedBuf() {
-        if (p) ::VirtualFree(p, 0, MEM_RELEASE);
-    }
-};
-
-// Volume handles clamp reads at the NTFS file-system size, which sits a few
-// sectors short of the partition end (the backup boot sector lives there);
-// this lifts the clamp to the full partition. Harmless on non-volume handles.
-void allow_extended_dasd(HANDLE h) {
-    DWORD br = 0;
-    ::DeviceIoControl(h, FSCTL_ALLOW_EXTENDED_DASD_IO, nullptr, 0, nullptr, 0, &br, nullptr);
-}
-
-bool device_length(HANDLE h, std::uint64_t& out) {
-    GET_LENGTH_INFORMATION gl{};
-    DWORD br = 0;
-    if (!::DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0, &gl, sizeof(gl), &br,
-                           nullptr))
-        return false;
-    out = static_cast<std::uint64_t>(gl.Length.QuadPart);
-    return true;
-}
-
-std::uint32_t disk_sector_size(HANDLE h) {
-    DISK_GEOMETRY_EX g{};
-    DWORD br = 0;
-    if (::DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, nullptr, 0, &g, sizeof(g), &br,
-                          nullptr) &&
-        g.Geometry.BytesPerSector)
-        return g.Geometry.BytesPerSector;
-    return 512;
-}
-
-// First disk extent of a volume; single receives whether it is the only one.
-bool volume_extent(HANDLE hvol, int& disk, std::uint64_t& off, std::uint64_t& len,
-                   bool& single) {
-    alignas(8) std::uint8_t buf[sizeof(VOLUME_DISK_EXTENTS) + 8 * sizeof(DISK_EXTENT)];
-    DWORD br = 0;
-    if (!::DeviceIoControl(hvol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, nullptr, 0, buf,
-                           sizeof(buf), &br, nullptr))
-        return false;
-    const auto* de = reinterpret_cast<const VOLUME_DISK_EXTENTS*>(buf);
-    if (de->NumberOfDiskExtents == 0) return false;
-    single = de->NumberOfDiskExtents == 1;
-    disk = static_cast<int>(de->Extents[0].DiskNumber);
-    off = static_cast<std::uint64_t>(de->Extents[0].StartingOffset.QuadPart);
-    len = static_cast<std::uint64_t>(de->Extents[0].ExtentLength.QuadPart);
-    return true;
-}
-
 // GPT disk GUID or MBR signature; left zeroed for uninitialized disks.
 void disk_identity(HANDLE hdisk, std::array<std::uint8_t, 16>& id) {
     std::vector<std::uint8_t> buf(64 * 1024);
@@ -199,34 +81,6 @@ void disk_identity(HANDLE hdisk, std::array<std::uint8_t, 16>& id) {
         std::memcpy(id.data(), &dl->Gpt.DiskId, 16);
     else if (dl->PartitionStyle == PARTITION_STYLE_MBR)
         std::memcpy(id.data(), &dl->Mbr.Signature, 4);
-}
-
-std::wstring volume_guid_name(const std::wstring& mount_root) { // "X:\" etc.
-    wchar_t buf[MAX_PATH]{};
-    if (!::GetVolumeNameForVolumeMountPointW(mount_root.c_str(), buf, MAX_PATH)) return {};
-    return buf; // volume GUID path with the trailing backslash
-}
-
-// Finds the \\?\Volume{...}\ name whose DOS device maps to an NT device name
-// like \Device\HarddiskVolume3.
-std::wstring guid_name_for_nt_device(const std::wstring& nt_name) {
-    wchar_t vol[MAX_PATH];
-    HANDLE f = ::FindFirstVolumeW(vol, MAX_PATH);
-    if (f == INVALID_HANDLE_VALUE) return {};
-    std::wstring found;
-    do {
-        const std::wstring name = vol; // volume GUID path with the trailing backslash
-        if (name.size() < 6) continue;
-        const std::wstring qname = name.substr(4, name.size() - 5); // Volume{...}
-        wchar_t target[512];
-        if (::QueryDosDeviceW(qname.c_str(), target, 512) &&
-            _wcsicmp(target, nt_name.c_str()) == 0) {
-            found = name;
-            break;
-        }
-    } while (::FindNextVolumeW(f, vol, MAX_PATH));
-    ::FindVolumeClose(f);
-    return found;
 }
 
 bool id_from_guid_name(const std::wstring& name, std::array<std::uint8_t, 16>& id) {
@@ -246,15 +100,6 @@ void fallback_id(const std::wstring& s, std::array<std::uint8_t, 16>& id) {
         h *= 1099511628211ull;
     }
     std::memcpy(id.data(), &h, 8);
-}
-
-// First DOS path of a volume ("C:\") for friendlier log lines.
-std::wstring volume_display(const std::wstring& guid_name) {
-    wchar_t buf[512]{};
-    DWORD ret = 0;
-    if (::GetVolumePathNamesForVolumeNameW(guid_name.c_str(), buf, 512, &ret) && buf[0])
-        return buf;
-    return guid_name;
 }
 
 bool resolve_source(const Options& opt, Source& src, std::wstring& error) {
@@ -578,37 +423,8 @@ void setup_volumes(Source& src, const Options& opt, VssSnapshotSet& vss) {
 }
 
 // ---------------------------------------------------------------------------
-// GPT synthesis for --partition images
-
-#pragma pack(push, 1)
-struct GptHeader {
-    char signature[8];
-    std::uint32_t revision;
-    std::uint32_t header_size;
-    std::uint32_t header_crc;
-    std::uint32_t reserved;
-    std::uint64_t my_lba;
-    std::uint64_t alternate_lba;
-    std::uint64_t first_usable;
-    std::uint64_t last_usable;
-    std::uint8_t disk_guid[16];
-    std::uint64_t entries_lba;
-    std::uint32_t entry_count;
-    std::uint32_t entry_size;
-    std::uint32_t entries_crc;
-};
-static_assert(sizeof(GptHeader) == 92);
-
-struct GptEntry {
-    std::uint8_t type[16];
-    std::uint8_t id[16];
-    std::uint64_t first_lba;
-    std::uint64_t last_lba;
-    std::uint64_t attrs;
-    wchar_t name[36];
-};
-static_assert(sizeof(GptEntry) == 128);
-#pragma pack(pop)
+// GPT synthesis for --partition images (the layout itself lives in gpt.h,
+// shared with the restore side that reads it back)
 
 std::uint32_t crc32(const void* data, std::size_t len) {
     static const auto table = [] {
@@ -636,17 +452,14 @@ bool write_partition_gpt(HANDLE disk, std::uint64_t vsize, std::uint32_t sector,
     GUID disk_guid{}, part_guid{};
     ::CoCreateGuid(&disk_guid);
     ::CoCreateGuid(&part_guid);
-    static constexpr GUID kBasicData = {
-        0xEBD0A0A2, 0xB9E5, 0x4433, {0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7}};
 
     std::vector<std::uint8_t> entries(kGptEntryBytes, 0);
     GptEntry e{};
-    std::memcpy(e.type, &kBasicData, 16);
+    std::memcpy(e.type, &kBasicDataPartition, 16);
     std::memcpy(e.id, &part_guid, 16);
     e.first_lba = part_off / sector;
     e.last_lba = (part_off + part_len) / sector - 1;
-    static constexpr wchar_t kName[] = L"tilecopy";
-    std::memcpy(e.name, kName, sizeof(kName));
+    std::memcpy(e.name, kImagePartitionName, sizeof(kImagePartitionName));
     std::memcpy(entries.data(), &e, sizeof(e));
     const std::uint32_t entries_crc = crc32(entries.data(), entries.size());
 
