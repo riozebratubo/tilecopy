@@ -1,0 +1,103 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No -G: let CMake pick whichever Visual Studio the runner image has
+      # (build.bat pins VS 2026, which the hosted image may not ship).
+      - name: Configure
+        run: cmake -B build -S . -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # Only proves the exe loads and its imports resolve; the real features
+      # need raw disks / VSS and are not exercised in CI.
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $out = & .\build\Release\tilecopy.exe --help 2>&1 | Out-String
+          Write-Output $out
+          if (-not $out.Trim()) { Write-Error 'tilecopy --help printed nothing'; exit 1 }
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tilecopy
+          path: build/Release/tilecopy.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags, for the notes and the previous-tag lookup
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tilecopy
+          path: dist
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Tag must match the version in CMakeLists.txt (same check as release.py).
+          $cmake = Get-Content CMakeLists.txt -Raw
+          if ($cmake -notmatch 'project\s*\(\s*\w+\s+VERSION\s+([\d.]+)') {
+            Write-Error 'Could not find VERSION in CMakeLists.txt'; exit 1
+          }
+          $cmakeVersion = $Matches[1]
+          $tagVersion = $env:TAG.TrimStart('v')
+          $baseVersion = ($tagVersion -split '-')[0]
+          if ($baseVersion -ne $cmakeVersion) {
+            Write-Error "Tag $env:TAG does not match CMakeLists.txt version $cmakeVersion"; exit 1
+          }
+
+          # release.py creates the release (and pushes the tag) itself; that tag
+          # push lands here too, so leave an existing release alone.
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "Release $env:TAG already exists; leaving it untouched."
+            exit 0
+          }
+
+          # Notes: commits since the previous tag, like release.py's prefill.
+          $prev = git describe --tags --abbrev=0 "$env:TAG^" 2>$null
+          if ($LASTEXITCODE -eq 0 -and $prev) {
+            $log = git --no-pager log "$prev..$env:TAG" --oneline --no-decorate
+            $header = "Changes since ${prev}:"
+          } else {
+            $log = git --no-pager log $env:TAG --oneline --no-decorate
+            $header = 'Changes:'
+          }
+          $notes = @($header, '') + ($log | ForEach-Object { "- $_" })
+          $notes -join "`n" | Set-Content -Encoding utf8 notes.md
+
+          $ghArgs = @($env:TAG, 'dist/tilecopy.exe',
+                    '--title', "tilecopy $tagVersion",
+                    '--notes-file', 'notes.md',
+                    '--verify-tag')
+          # v1.2.3-rc1 style tags become pre-releases.
+          if ($tagVersion -ne $baseVersion) { $ghArgs += '--prerelease' }
+          gh release create @ghArgs
