@@ -723,8 +723,18 @@ void process_chunk(ImageJob& job, HANDLE base, const std::vector<HandleCloser>& 
     // hash is the precomputed zero hash, no need to hash 1 MiB of zeros.
     const Sha256& zero_hash = len == job.chunk_size ? job.zero_full : job.zero_tail;
     const auto th = std::chrono::steady_clock::now();
-    const Sha256 h = any_read ? hasher.hash(buf, static_cast<std::size_t>(len)) : zero_hash;
+    Sha256 h = zero_hash;
+    const bool hashed = !any_read || hasher.hash(buf, static_cast<std::size_t>(len), h);
     job.ns_hash.fetch_add(since(th), std::memory_order_relaxed);
+    if (!hashed) {
+        // The content was read fine but cannot be fingerprinted, so nothing
+        // recorded for this chunk could be trusted; poison it like a failed
+        // read and let the next run redo it.
+        job.db.image.chunks[static_cast<size_t>(idx)] = kFailedChunk;
+        job.failed.fetch_add(1, std::memory_order_relaxed);
+        log_error(std::format(L"chunk {} (offset {}): SHA-256 computation failed", idx, c0));
+        return;
+    }
     // Nothing was read, or everything read turned out to be zeros: the chunk
     // can stay (or become) a hole.
     const bool zero = !any_read || h == zero_hash;
@@ -1062,8 +1072,13 @@ int run_image(const Options& opt) {
             return 1;
         }
         const std::vector<std::uint8_t> zeros(static_cast<size_t>(job.chunk_size), 0);
-        job.zero_full = hasher.hash(zeros.data(), static_cast<std::size_t>(job.chunk_size));
-        job.zero_tail = hasher.hash(zeros.data(), static_cast<std::size_t>(job.tail_len));
+        if (!hasher.hash(zeros.data(), static_cast<std::size_t>(job.chunk_size),
+                         job.zero_full) ||
+            !hasher.hash(zeros.data(), static_cast<std::size_t>(job.tail_len),
+                         job.zero_tail)) {
+            log_error(L"SHA-256 computation failed");
+            return 1;
+        }
     }
 
     const auto started = std::chrono::steady_clock::now();

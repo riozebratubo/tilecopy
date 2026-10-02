@@ -18,6 +18,7 @@
 #include <deque>
 #include <cwctype>
 #include <format>
+#include <map>
 #include <set>
 #include <thread>
 #include <vector>
@@ -34,7 +35,8 @@ struct CopyStats {
 };
 
 // One entry per folder checked with --folder-logs. The last file task of the
-// folder to finish prints it; folders with no file tasks print during the walk.
+// folder to finish prints it; folders with no file tasks print during the
+// walk (a USN run only creates entries for folders that have tasks).
 struct FolderLog {
     explicit FolderLog(std::wstring l) : label(std::move(l)) {}
     std::wstring label;
@@ -90,7 +92,7 @@ struct Job {
     std::wstring db_norm, db_tmp_norm;
     Excluder excl;
     std::vector<FileTask> tasks;
-    std::deque<FolderLog> folder_logs; // stable addresses; filled by the walk only
+    std::deque<FolderLog> folder_logs; // stable addresses; filled before tasks run
     std::vector<std::pair<fs::path, fs::path>> dir_meta; // post-order (children first)
     std::set<std::wstring> seen_keys;
     CopyStats stats;
@@ -393,12 +395,17 @@ bool hash_file_chunks(const fs::path& src, std::uint64_t chunk_size, std::vector
     std::vector<std::uint8_t> buf(chunk_size);
     while (ok) {
         DWORD read = 0;
-        if (!::ReadFile(h, buf.data(), static_cast<DWORD>(chunk_size), &read, nullptr))
+        if (!::ReadFile(h, buf.data(), static_cast<DWORD>(chunk_size), &read, nullptr)) {
             ok = false;
-        else if (read == 0)
+        } else if (read == 0) {
             break;
-        else
-            out.push_back(hasher.hash(buf.data(), read));
+        } else {
+            Sha256 h256;
+            if (hasher.hash(buf.data(), read, h256))
+                out.push_back(h256);
+            else
+                ok = false;
+        }
     }
     ::CloseHandle(h);
     if (!ok) out.clear();
@@ -626,6 +633,23 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
         }
     }
 
+    // --folder-logs: the walk makes one entry per folder it descends into;
+    // here only folders that actually receive a file task get one.
+    std::map<std::wstring, FolderLog*> flogs; // key: lowercased parent rel
+    auto folder_log_for = [&](const std::wstring& rel) -> FolderLog* {
+        if (!job.opt->folder_logs) return nullptr;
+        const size_t sep = rel.find_last_of(L'\\');
+        const std::wstring parent =
+            sep == std::wstring::npos ? std::wstring{} : rel.substr(0, sep);
+        std::wstring key = parent;
+        for (auto& c : key) c = static_cast<wchar_t>(std::towlower(c));
+        auto [it, inserted] = flogs.try_emplace(std::move(key), nullptr);
+        if (inserted)
+            it->second = &job.folder_logs.emplace_back(
+                parent.empty() ? job.src_root.native() : parent);
+        return it->second;
+    };
+
     // The walk creates destination directories as it descends; here they must
     // be created on demand for whatever parents a changed entry needs.
     std::set<std::wstring> ensured;
@@ -665,6 +689,10 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
         if (e.is_link) {
             if (!ensure_parents(e.rel)) continue;
             handle_link(job, spath, dpath, e.is_dir, e.rel);
+            // A file record under this rel now describes a link, not a file;
+            // drop it the way a full walk would (links never enter seen_keys).
+            job.db.files.erase(e.rel);
+            job.seen_keys.erase(e.rel);
             add_parent(e.rel);
         } else if (e.is_dir) {
             if (!ensure_parents(e.rel)) continue;
@@ -676,6 +704,10 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
                     continue;
                 }
             }
+            // Same staleness as the link case when a directory replaced a
+            // recorded file under this rel.
+            job.db.files.erase(e.rel);
+            job.seen_keys.erase(e.rel);
             meta_parents.insert(e.rel);
             add_parent(e.rel);
         } else {
@@ -691,10 +723,12 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
             if (!ensure_parents(e.rel)) continue;
             auto [it, inserted] = job.db.files.try_emplace(e.rel);
             job.seen_keys.insert(e.rel);
+            FolderLog* flog = folder_log_for(e.rel);
+            if (flog) flog->pending.fetch_add(1, std::memory_order_relaxed);
             job.tasks.push_back({spath, dpath, e.rel, &it->second, !inserted,
                                  (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) |
                                      fad.nFileSizeLow,
-                                 filetime_to_i64(fad.ftLastWriteTime), nullptr});
+                                 filetime_to_i64(fad.ftLastWriteTime), flog});
             add_parent(e.rel);
         }
     }

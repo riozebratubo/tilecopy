@@ -21,12 +21,13 @@ Sha256Hasher::~Sha256Hasher() {
     if (alg_) ::BCryptCloseAlgorithmProvider(static_cast<BCRYPT_ALG_HANDLE>(alg_), 0);
 }
 
-Sha256 Sha256Hasher::hash(const void* data, std::size_t len) {
-    Sha256 out{};
-    ::BCryptHash(static_cast<BCRYPT_ALG_HANDLE>(alg_), nullptr, 0,
-                 static_cast<PUCHAR>(const_cast<void*>(data)), static_cast<ULONG>(len),
-                 out.data(), static_cast<ULONG>(out.size()));
-    return out;
+bool Sha256Hasher::hash(const void* data, std::size_t len, Sha256& out) {
+    out = {};
+    return alg_ &&
+           NT_SUCCESS(::BCryptHash(static_cast<BCRYPT_ALG_HANDLE>(alg_), nullptr, 0,
+                                   static_cast<PUCHAR>(const_cast<void*>(data)),
+                                   static_cast<ULONG>(len), out.data(),
+                                   static_cast<ULONG>(out.size())));
 }
 
 } // namespace tc

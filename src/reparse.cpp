@@ -106,10 +106,10 @@ bool clone_reparse_point(const std::filesystem::path& src, const std::filesystem
         const std::wstring target = symlink_target(rdb);
         DWORD flags = (is_directory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0u) |
                       SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
-        if (!::CreateSymbolicLinkW(dst.c_str(), target.c_str(), flags)) {
+        if (!::CreateSymbolicLinkW(dext.c_str(), target.c_str(), flags)) {
             // Pre-1703 Windows 10 rejects the unprivileged-create flag outright.
             flags &= ~SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
-            if (!::CreateSymbolicLinkW(dst.c_str(), target.c_str(), flags))
+            if (!::CreateSymbolicLinkW(dext.c_str(), target.c_str(), flags))
                 return set_error(error, L"cannot create symbolic link (needs admin or Developer Mode)");
         }
         return true;

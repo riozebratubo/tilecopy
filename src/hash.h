@@ -18,7 +18,9 @@ public:
     Sha256Hasher& operator=(const Sha256Hasher&) = delete;
 
     bool valid() const { return alg_ != nullptr; }
-    Sha256 hash(const void* data, std::size_t len);
+    // False when CNG fails; out is zeroed then, which collides with the
+    // kUnwrittenChunk sentinel, so callers must never use it as a digest.
+    bool hash(const void* data, std::size_t len, Sha256& out);
 
 private:
     void* alg_ = nullptr; // BCRYPT_ALG_HANDLE

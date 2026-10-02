@@ -7,22 +7,76 @@
 
 namespace tc {
 
-std::wstring utf8_to_wide(std::string_view s) {
-    if (s.empty()) return {};
-    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring w(static_cast<size_t>(n), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
-    return w;
+// Hand-rolled WTF-8 instead of the CP_UTF8 conversions: NTFS names may hold
+// unpaired surrogates, which WideCharToMultiByte flattens to U+FFFD, so such
+// names would never round-trip through the database keys and the files were
+// recopied every run. Here a lone surrogate is encoded as its own three-byte
+// sequence and decoded back to the identical UTF-16 unit; valid input
+// produces byte-identical standard UTF-8.
+std::string wide_to_utf8(std::wstring_view w) {
+    std::string out;
+    out.reserve(w.size() * 3);
+    for (size_t i = 0; i < w.size(); ++i) {
+        std::uint32_t cp = w[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < w.size() && w[i + 1] >= 0xDC00 &&
+            w[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (w[i + 1] - 0xDC00);
+            ++i;
+        }
+        if (cp < 0x80) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) { // unpaired surrogates land here as-is
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+    return out;
 }
 
-std::string wide_to_utf8(std::wstring_view w) {
-    if (w.empty()) return {};
-    const int n = ::WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return {};
-    std::string s(static_cast<size_t>(n), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
-    return s;
+std::wstring utf8_to_wide(std::string_view s) {
+    std::wstring out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        const std::uint8_t b = static_cast<std::uint8_t>(s[i]);
+        std::uint32_t cp = 0;
+        size_t len = 0;
+        if (b < 0x80) { cp = b; len = 1; }
+        else if ((b & 0xE0) == 0xC0) { cp = b & 0x1Fu; len = 2; }
+        else if ((b & 0xF0) == 0xE0) { cp = b & 0x0Fu; len = 3; }
+        else if ((b & 0xF8) == 0xF0) { cp = b & 0x07u; len = 4; }
+        // Malformed bytes become U+FFFD one at a time, matching what the
+        // CP_UTF8 conversion used to do with invalid input.
+        bool ok = len != 0 && i + len <= s.size();
+        for (size_t k = 1; ok && k < len; ++k) {
+            const std::uint8_t c = static_cast<std::uint8_t>(s[i + k]);
+            if ((c & 0xC0) != 0x80) ok = false;
+            else cp = (cp << 6) | (c & 0x3Fu);
+        }
+        if (!ok || cp > 0x10FFFF) {
+            out.push_back(L'\xFFFD');
+            ++i;
+            continue;
+        }
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            out.push_back(static_cast<wchar_t>(0xD800 + (cp >> 10)));
+            out.push_back(static_cast<wchar_t>(0xDC00 + (cp & 0x3FF)));
+        } else { // surrogate-range values pass through: the WTF-8 round trip
+            out.push_back(static_cast<wchar_t>(cp));
+        }
+        i += len;
+    }
+    return out;
 }
 
 std::wstring win32_error_message(DWORD err) {

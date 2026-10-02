@@ -33,6 +33,16 @@ bool ChunkDatabase::load(const std::filesystem::path& db_file, std::uint64_t exp
                          bool expect_image, ChunkDatabase& out) {
     std::ifstream in(db_file, std::ios::binary);
     if (!in) return false;
+    in.seekg(0, std::ios::end);
+    const std::uint64_t file_bytes = static_cast<std::uint64_t>(in.tellg());
+    in.seekg(0);
+    // A corrupt count could demand an allocation far past anything the file
+    // can hold; bound every chunk-array resize by the bytes left to read so a
+    // damaged database fails the load instead of aborting on bad_alloc.
+    const auto fits_chunks = [&](std::uint64_t count) {
+        const std::uint64_t pos = static_cast<std::uint64_t>(in.tellg());
+        return pos <= file_bytes && count <= (file_bytes - pos) / sizeof(Sha256);
+    };
 
     std::uint32_t magic = 0, version = 0;
     std::uint64_t chunk_size = 0, file_count = 0;
@@ -55,6 +65,7 @@ bool ChunkDatabase::load(const std::filesystem::path& db_file, std::uint64_t exp
             !read_pod(in, chunk_count))
             return false;
         if (chunk_count != (db.image.source_size + chunk_size - 1) / chunk_size) return false;
+        if (!fits_chunks(chunk_count)) return false;
         db.image.chunks.resize(chunk_count);
         if (chunk_count &&
             !in.read(reinterpret_cast<char*>(db.image.chunks.data()),
@@ -88,6 +99,7 @@ bool ChunkDatabase::load(const std::filesystem::path& db_file, std::uint64_t exp
             return false;
         // A record can never have more chunks than its size implies.
         if (chunk_count > rec.file_size / chunk_size + 1) return false;
+        if (!fits_chunks(chunk_count)) return false;
         rec.chunks.resize(chunk_count);
         if (chunk_count &&
             !in.read(reinterpret_cast<char*>(rec.chunks.data()),

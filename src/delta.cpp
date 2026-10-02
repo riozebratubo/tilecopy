@@ -112,6 +112,13 @@ DeltaResult delta_copy_file(const std::filesystem::path& src, const std::filesys
         }
 
         if (full_copy) {
+            // CREATE_ALWAYS refuses to overwrite a hidden or system file
+            // unless the new attributes carry those bits; strip them so the
+            // rewrite goes through (copy_metadata reapplies the source's
+            // attributes afterwards).
+            if (dst_is_plain_file &&
+                (dattrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)))
+                ::SetFileAttributesW(dext.c_str(), FILE_ATTRIBUTE_NORMAL);
             hd.h = ::CreateFileW(dext.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                  FILE_ATTRIBUTE_NORMAL, nullptr);
             if (hd.h == INVALID_HANDLE_VALUE) {
@@ -141,7 +148,11 @@ DeltaResult delta_copy_file(const std::filesystem::path& src, const std::filesys
         }
         if (read == 0) break;
 
-        const Sha256 h = hasher.hash(buf.data(), read);
+        Sha256 h;
+        if (!hasher.hash(buf.data(), read, h)) {
+            res.error = L"SHA-256 computation failed";
+            return res;
+        }
         const size_t idx = new_chunks.size();
         new_chunks.push_back(h);
 

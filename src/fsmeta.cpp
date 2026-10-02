@@ -45,8 +45,9 @@ HANDLE open_meta(const std::wstring& path, DWORD access) {
 }
 
 // Copies owner/group/DACL (and SACL when privileged) via handles so reparse
-// points get their own security, not their target's.
-bool copy_security(const std::wstring& src, const std::wstring& dst) {
+// points get their own security, not their target's. Returns ERROR_SUCCESS
+// or the error of the step that failed.
+DWORD copy_security(const std::wstring& src, const std::wstring& dst) {
     SECURITY_INFORMATION si =
         OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     DWORD read_access = READ_CONTROL;
@@ -56,16 +57,15 @@ bool copy_security(const std::wstring& src, const std::wstring& dst) {
     }
 
     UniqueHandle hs(open_meta(src, read_access));
-    if (!hs.valid()) return false;
+    if (!hs.valid()) return ::GetLastError();
 
     PSID owner = nullptr, group = nullptr;
     PACL dacl = nullptr, sacl = nullptr;
     PSECURITY_DESCRIPTOR sd = nullptr;
-    if (::GetSecurityInfo(hs.get(), SE_FILE_OBJECT, si, &owner, &group, &dacl, &sacl, &sd) !=
-        ERROR_SUCCESS)
-        return false;
+    DWORD rc =
+        ::GetSecurityInfo(hs.get(), SE_FILE_OBJECT, si, &owner, &group, &dacl, &sacl, &sd);
+    if (rc != ERROR_SUCCESS) return rc;
 
-    bool ok = false;
     // Try the full set first, then degrade: without SACL, then DACL only.
     struct Attempt { SECURITY_INFORMATION si; DWORD access; };
     const Attempt attempts[] = {
@@ -76,31 +76,33 @@ bool copy_security(const std::wstring& src, const std::wstring& dst) {
     };
     for (const Attempt& a : attempts) {
         UniqueHandle hd(open_meta(dst, a.access));
-        if (!hd.valid()) continue;
-        if (::SetSecurityInfo(hd.get(), SE_FILE_OBJECT, a.si,
-                              (a.si & OWNER_SECURITY_INFORMATION) ? owner : nullptr,
-                              (a.si & GROUP_SECURITY_INFORMATION) ? group : nullptr,
-                              (a.si & DACL_SECURITY_INFORMATION) ? dacl : nullptr,
-                              (a.si & SACL_SECURITY_INFORMATION) ? sacl : nullptr) ==
-            ERROR_SUCCESS) {
-            ok = true;
-            break;
+        if (!hd.valid()) {
+            rc = ::GetLastError();
+            continue;
         }
+        rc = ::SetSecurityInfo(hd.get(), SE_FILE_OBJECT, a.si,
+                               (a.si & OWNER_SECURITY_INFORMATION) ? owner : nullptr,
+                               (a.si & GROUP_SECURITY_INFORMATION) ? group : nullptr,
+                               (a.si & DACL_SECURITY_INFORMATION) ? dacl : nullptr,
+                               (a.si & SACL_SECURITY_INFORMATION) ? sacl : nullptr);
+        if (rc == ERROR_SUCCESS) break;
     }
 
     ::LocalFree(sd);
-    return ok;
+    return rc;
 }
 
-bool copy_times(const std::wstring& src, const std::wstring& dst) {
+// Returns ERROR_SUCCESS or the error of the step that failed.
+DWORD copy_times(const std::wstring& src, const std::wstring& dst) {
     UniqueHandle hs(open_meta(src, FILE_READ_ATTRIBUTES));
-    if (!hs.valid()) return false;
+    if (!hs.valid()) return ::GetLastError();
     FILETIME creation, access, write;
-    if (!::GetFileTime(hs.get(), &creation, &access, &write)) return false;
+    if (!::GetFileTime(hs.get(), &creation, &access, &write)) return ::GetLastError();
 
     UniqueHandle hd(open_meta(dst, FILE_WRITE_ATTRIBUTES));
-    if (!hd.valid()) return false;
-    return ::SetFileTime(hd.get(), &creation, &access, &write) != 0;
+    if (!hd.valid()) return ::GetLastError();
+    if (!::SetFileTime(hd.get(), &creation, &access, &write)) return ::GetLastError();
+    return ERROR_SUCCESS;
 }
 
 } // namespace
@@ -123,7 +125,13 @@ bool copy_metadata(const std::filesystem::path& src, const std::filesystem::path
     const std::wstring s = extended_path(src);
     const std::wstring d = extended_path(dst);
 
-    const bool sec_ok = copy_security(s, d);
+    // Each step keeps its own error; the message below must name a call that
+    // actually failed, not whatever the last (possibly successful) call left
+    // in the thread's error slot.
+    DWORD last_err = ERROR_SUCCESS;
+
+    const DWORD sec_rc = copy_security(s, d);
+    if (sec_rc != ERROR_SUCCESS) last_err = sec_rc;
 
     bool attr_ok = false;
     const DWORD attrs = ::GetFileAttributesW(s.c_str());
@@ -131,14 +139,18 @@ bool copy_metadata(const std::filesystem::path& src, const std::filesystem::path
         // Reparse/directory bits cannot be assigned; SetFileAttributes ignores
         // what does not apply, so pass the raw value through.
         attr_ok = ::SetFileAttributesW(d.c_str(), attrs) != 0;
+        if (!attr_ok) last_err = ::GetLastError();
+    } else {
+        last_err = ::GetLastError();
     }
 
     // Timestamps last so the writes above do not disturb them.
-    const bool time_ok = copy_times(s, d);
+    const DWORD time_rc = copy_times(s, d);
+    if (time_rc != ERROR_SUCCESS) last_err = time_rc;
 
-    if (!sec_ok && !attr_ok && !time_ok) {
+    if (sec_rc != ERROR_SUCCESS && !attr_ok && time_rc != ERROR_SUCCESS) {
         error = std::format(L"could not copy any metadata: {}",
-                            win32_error_message(::GetLastError()));
+                            win32_error_message(last_err));
         return false;
     }
     return true;

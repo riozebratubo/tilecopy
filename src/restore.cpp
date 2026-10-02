@@ -410,14 +410,20 @@ void restore_chunk(RestoreJob& job, HANDLE img, std::uint64_t idx, std::uint8_t*
             job.unverified.fetch_add(1, std::memory_order_relaxed);
         } else {
             const auto th = std::chrono::steady_clock::now();
-            const Sha256 h = hasher.hash(buf, static_cast<std::size_t>(len));
+            Sha256 h;
+            const bool hashed = hasher.hash(buf, static_cast<std::size_t>(len), h);
             job.ns_hash.fetch_add(since(th), std::memory_order_relaxed);
             // A hole in the image is recorded as unwritten and reads as zeros.
             const Sha256& want =
                 slot == kUnwrittenChunk
                     ? (len == job.chunk_size ? job.zero_full : job.zero_tail)
                     : slot;
-            if (h != want) {
+            if (!hashed) {
+                job.unverified.fetch_add(1, std::memory_order_relaxed);
+                log_error(std::format(L"chunk {} (offset {}): SHA-256 computation failed; "
+                                      L"restored without verification",
+                                      idx, off));
+            } else if (h != want) {
                 job.mismatched.fetch_add(1, std::memory_order_relaxed);
                 log_error(std::format(L"chunk {} (offset {}) does not match the hash recorded "
                                       L"for it; the image content is not what was backed up",
@@ -534,10 +540,15 @@ void update_disk_properties(HANDLE hdisk) {
 }
 
 // Locks and dismounts a volume; the lock lasts exactly as long as the handle,
-// which is why the caller keeps them all open for the whole restore.
-bool lock_and_dismount(HANDLE hv, bool& locked) {
+// which is why the caller keeps them all open for the whole restore. A
+// dismount without the lock is the forced kind that invalidates every open
+// handle on the volume, so it is only issued when the caller says the volume
+// is forfeit anyway (a whole-disk restore the user already confirmed) - never
+// on a path that is about to abort and give the volume back.
+bool lock_and_dismount(HANDLE hv, bool& locked, bool dismount_unlocked) {
     DWORD br = 0;
     locked = ::DeviceIoControl(hv, FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0, &br, nullptr) != 0;
+    if (!locked && !dismount_unlocked) return false;
     return ::DeviceIoControl(hv, FSCTL_DISMOUNT_VOLUME, nullptr, 0, nullptr, 0, &br, nullptr) !=
            0;
 }
@@ -798,7 +809,7 @@ int run_restore(const Options& opt) {
                 continue;
             }
             bool locked = false;
-            if (!lock_and_dismount(hv.h, locked))
+            if (!lock_and_dismount(hv.h, locked, /*dismount_unlocked=*/true))
                 log_info(std::format(L"note: {} could not be dismounted; writes over it may "
                                      L"fail",
                                      v.display));
@@ -825,7 +836,7 @@ int run_restore(const Options& opt) {
         // system corrupts it, so an unlockable volume is a hard stop here.
         allow_extended_dasd(target_h.h);
         bool locked = false;
-        if (!lock_and_dismount(target_h.h, locked) || !locked) {
+        if (!lock_and_dismount(target_h.h, locked, /*dismount_unlocked=*/false) || !locked) {
             log_error(std::format(L"cannot lock and dismount {}: {}. Close anything using it "
                                   L"(Explorer windows, indexing, antivirus) and try again",
                                   target.display, win32_error_message(::GetLastError())));
@@ -858,8 +869,12 @@ int run_restore(const Options& opt) {
             return 1;
         }
         const std::vector<std::uint8_t> zeros(static_cast<size_t>(chunk_size), 0);
-        job.zero_full = hasher.hash(zeros.data(), static_cast<std::size_t>(chunk_size));
-        job.zero_tail = hasher.hash(zeros.data(), static_cast<std::size_t>(job.tail_len));
+        if (!hasher.hash(zeros.data(), static_cast<std::size_t>(chunk_size), job.zero_full) ||
+            !hasher.hash(zeros.data(), static_cast<std::size_t>(job.tail_len),
+                         job.zero_tail)) {
+            log_error(L"SHA-256 computation failed");
+            return 1;
+        }
     }
 
     log_info(std::format(L"restoring {} onto {} in {} chunk(s) of {}{}{}",
