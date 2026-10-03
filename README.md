@@ -218,8 +218,13 @@ tilecopy --restore E:\backups\data.vhdx  D:         # a volume image onto D:
   `--drive C: C:\backup`) is rejected — it would be copied into itself — unless
   it is covered by `--exclude-folder`.
 - **Metadata** (attributes, creation/access/write times, owner/group/DACL, and
-  SACL when running elevated) is always copied, best-effort, for files and
-  folders. Directory timestamps are applied children-first so they survive.
+  SACL when running elevated) is copied, best-effort, with every file or
+  folder that is copied or moved. Directory timestamps are applied
+  children-first so they survive. A change to metadata alone (say,
+  permissions) leaves the write time untouched, so plain scans skip the file
+  unread and the change stays unpropagated until its content changes;
+  `--ntfs-map-origin` runs see the journal record for it and refresh the
+  metadata even when the content is skipped.
 - **Symbolic links, junctions and other reparse points** are copied as links,
   never followed — including during mirror deletion. Creating symlinks may
   require elevation or Windows Developer Mode.

@@ -31,7 +31,9 @@ void write_pod(std::ostream& out, const T& v) {
 
 bool ChunkDatabase::load(const std::filesystem::path& db_file, std::uint64_t expected_chunk_size,
                          bool expect_image, ChunkDatabase& out) {
-    std::ifstream in(db_file, std::ios::binary);
+    // The \\?\ form, because the CRT path (no longPathAware manifest) cannot
+    // open the deep destinations the rest of the tool handles.
+    std::ifstream in(extended_path(db_file).c_str(), std::ios::binary);
     if (!in) return false;
     in.seekg(0, std::ios::end);
     const std::uint64_t file_bytes = static_cast<std::uint64_t>(in.tellg());
@@ -118,7 +120,8 @@ bool ChunkDatabase::save(const std::filesystem::path& db_file, std::wstring& err
     tmp += L".tmp";
 
     {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        // \\?\ form for the same long-path reason as in load.
+        std::ofstream out(extended_path(tmp).c_str(), std::ios::binary | std::ios::trunc);
         if (!out) {
             error = std::format(L"cannot create database file {}", tmp.native());
             return false;

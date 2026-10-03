@@ -4,6 +4,7 @@
 
 #include <winioctl.h>
 
+#include <cwchar>
 #include <format>
 #include <vector>
 
@@ -54,8 +55,14 @@ std::wstring symlink_target(const TcReparseDataBuffer* rdb) {
     const wchar_t* base = sl.PathBuffer;
     std::wstring sub(base + sl.SubstituteNameOffset / sizeof(WCHAR),
                      sl.SubstituteNameLength / sizeof(WCHAR));
-    if (!(sl.Flags & SYMLINK_FLAG_RELATIVE) && sub.starts_with(LR"(\??\)"))
+    if (!(sl.Flags & SYMLINK_FLAG_RELATIVE) && sub.starts_with(LR"(\??\)")) {
         sub.erase(0, 4);
+        // A network target is stored as \??\UNC\server\share\...; the Win32
+        // spelling CreateSymbolicLinkW expects is \\server\share\... (the
+        // bare UNC\... remainder would be taken as a relative path).
+        if (sub.size() > 4 && _wcsnicmp(sub.c_str(), L"UNC\\", 4) == 0)
+            sub.replace(0, 3, L"\\");
+    }
     return sub;
 }
 

@@ -95,6 +95,12 @@ struct Job {
     std::deque<FolderLog> folder_logs; // stable addresses; filled before tasks run
     std::vector<std::pair<fs::path, fs::path>> dir_meta; // post-order (children first)
     std::set<std::wstring> seen_keys;
+    // USN runs only: rels that already received a file task, so the subtree
+    // walk under a renamed directory cannot task a file twice (two tasks
+    // sharing one record must never run concurrently).
+    std::set<std::wstring> tasked;
+    bool usn_mode = false;
+    bool meta_on_skip = false; // journal-reported files refresh metadata even when skipped
     CopyStats stats;
     bool copying = true; // false with --make-db
 };
@@ -240,7 +246,10 @@ void walk_dir(Job& job, const fs::path& sdir, const fs::path& ddir, const std::w
                                    FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
     if (hf == INVALID_HANDLE_VALUE) {
         const DWORD err = ::GetLastError();
-        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_NO_MORE_FILES) {
+        // PATH_NOT_FOUND: the directory vanished between being reported (or
+        // enumerated by its parent) and this call - nothing left to copy.
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND &&
+            err != ERROR_NO_MORE_FILES) {
             job.stats.failed.fetch_add(1, std::memory_order_relaxed);
             log_error(std::format(L"cannot enumerate {}: {}", sdir.native(),
                                   win32_error_message(err)));
@@ -284,6 +293,7 @@ void walk_dir(Job& job, const fs::path& sdir, const fs::path& ddir, const std::w
             walk_dir(job, spath, dpath, child_rel, depth + 1);
             job.dir_meta.emplace_back(spath, dpath);
         } else {
+            if (job.usn_mode && !job.tasked.insert(child_rel).second) continue;
             auto [it, inserted] = job.db.files.try_emplace(child_rel);
             job.seen_keys.insert(child_rel);
             const std::uint64_t fsize =
@@ -326,6 +336,15 @@ bool run_task_copy(Job& job, FileTask& t) {
         return true;
     }
     if (r.skipped) {
+        // A USN run only visits files the journal reported changed; when the
+        // content, size and write time still match the record, what changed
+        // must be metadata (attributes, ACL, times) - apply it on its own,
+        // since no copy will carry it over.
+        if (job.meta_on_skip) {
+            std::wstring merr;
+            if (!copy_metadata(t.src, t.dst, false, merr))
+                log_error(std::format(L"metadata for {}: {}", label, merr));
+        }
         job.stats.skipped.fetch_add(1, std::memory_order_relaxed);
         job.stats.bytes_skipped.fetch_add(r.bytes_skipped, std::memory_order_relaxed);
         return false;
@@ -528,6 +547,11 @@ void detect_moves(Job& job) {
             t.had_record = true;
             job.db.files.erase(old_rel);
             bucket.erase(it);
+            // The rename carried the destination's old metadata along; bring
+            // over what the source holds at the new path.
+            std::wstring merr;
+            if (!copy_metadata(t.src, t.dst, false, merr))
+                log_error(std::format(L"metadata for {}: {}", t.rel, merr));
             job.stats.moved.fetch_add(1, std::memory_order_relaxed);
             if (opt.file_logs) log_info(std::format(L"moved    {} -> {}", old_rel, t.rel));
             break;
@@ -607,6 +631,8 @@ std::uint64_t excludes_fingerprint(const Excluder& excl) {
 // the source: only entries the journal reported are visited; every other
 // database record is trusted to still exist unchanged, destination included.
 void apply_usn_changes(Job& job, const UsnChanges& ch) {
+    job.usn_mode = true;
+    job.meta_on_skip = job.copying;
     for (const auto& kv : job.db.files) job.seen_keys.insert(kv.first);
 
     std::set<std::wstring> meta_parents; // dirs (rel) whose metadata to refresh
@@ -615,19 +641,42 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
         if (sep != std::wstring::npos) meta_parents.insert(rel.substr(0, sep));
     };
 
-    // Delete/rename-old records only carry the final name component; match it
-    // against the database keys and let the file system confirm the loss.
+    // Delete/rename-old records only carry the final name component, and a
+    // deleted or renamed directory produces no records at all for what was
+    // beneath it. Match every path component of each database key against the
+    // removed names and let the file system confirm the loss: the entry is
+    // gone, or it survives under a different on-disk case (a case-only
+    // rename), which leaves this key just as stale.
     if (!ch.removed_names.empty()) {
         const std::set<std::wstring> gone(ch.removed_names.begin(), ch.removed_names.end());
         for (const auto& kv : job.db.files) {
             const std::wstring& rel = kv.first;
-            const size_t sep = rel.find_last_of(L'\\');
-            std::wstring name = rel.substr(sep == std::wstring::npos ? 0 : sep + 1);
-            for (auto& c : name) c = static_cast<wchar_t>(std::towlower(c));
-            if (!gone.contains(name)) continue;
-            if (::GetFileAttributesW(extended_path(job.src_root / rel).c_str()) !=
-                INVALID_FILE_ATTRIBUTES)
-                continue;
+            bool hit = false;
+            for (size_t start = 0; !hit;) {
+                const size_t sep = rel.find(L'\\', start);
+                std::wstring comp = rel.substr(
+                    start, (sep == std::wstring::npos ? rel.size() : sep) - start);
+                for (auto& c : comp) c = static_cast<wchar_t>(std::towlower(c));
+                hit = gone.contains(comp);
+                if (sep == std::wstring::npos) break;
+                start = sep + 1;
+            }
+            if (!hit) continue;
+            bool stale = true;
+            HANDLE h = ::CreateFileW(
+                extended_path(job.src_root / rel).c_str(), FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                const std::wstring full = final_path(h);
+                ::CloseHandle(h);
+                // Still present under exactly this spelling: the removed name
+                // belonged to something else, or the path was reused; either
+                // way the record stands (an unresolvable path keeps it too).
+                stale = !full.empty() && !full.ends_with(L"\\" + rel);
+            }
+            if (!stale) continue;
             job.seen_keys.erase(rel);
             add_parent(rel);
         }
@@ -671,6 +720,7 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
         return true;
     };
 
+    std::vector<const UsnEntry*> renamed_dirs;
     for (const auto& e : ch.changed) {
         // Same filters the walk applies while descending.
         if (job.opt->mode == Mode::Drive &&
@@ -710,6 +760,10 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
             job.seen_keys.erase(e.rel);
             meta_parents.insert(e.rel);
             add_parent(e.rel);
+            // A renamed (or moved-in) directory is the one change the journal
+            // under-reports: its children carry no records of their own, so
+            // they must be rescanned like a full walk would.
+            if (e.renamed) renamed_dirs.push_back(&e);
         } else {
             WIN32_FILE_ATTRIBUTE_DATA fad;
             if (!::GetFileAttributesExW(extended_path(spath).c_str(), GetFileExInfoStandard,
@@ -721,6 +775,7 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
                 continue; // changed type after the checkpoint; the next run
                           // re-reads that part of the journal
             if (!ensure_parents(e.rel)) continue;
+            job.tasked.insert(e.rel);
             auto [it, inserted] = job.db.files.try_emplace(e.rel);
             job.seen_keys.insert(e.rel);
             FolderLog* flog = folder_log_for(e.rel);
@@ -732,6 +787,12 @@ void apply_usn_changes(Job& job, const UsnChanges& ch) {
             add_parent(e.rel);
         }
     }
+
+    // Deferred so every file the journal reported directly is tasked first
+    // (`tasked` then keeps these walks from doubling it up); directories
+    // created by ensure_directory above receive their children here.
+    for (const UsnEntry* d : renamed_dirs)
+        walk_dir(job, job.src_root / d->rel, job.dst_root / d->rel, d->rel, 1);
 
     if (!job.copying) return;
 

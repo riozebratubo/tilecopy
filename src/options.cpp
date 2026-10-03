@@ -133,7 +133,10 @@ Notes:
   - Only local drives are supported (no network drives or UNC paths).
   - Empty folders are always copied; symbolic links, junctions and other
     reparse points are copied as links, never followed.
-  - Attributes, timestamps and security data are always copied.)");
+  - Attributes, timestamps and security data are copied with every entry
+    that is copied or moved. A change to metadata alone (say, permissions)
+    leaves the write time untouched, so plain scans skip the file unread;
+    --ntfs-map-origin runs see the journal record and refresh the metadata.)");
 }
 
 namespace {

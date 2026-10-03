@@ -12,6 +12,10 @@ struct UsnEntry {
     std::wstring rel;     // path relative to the scanned root, on-disk case
     bool is_dir = false;
     bool is_link = false; // reparse point (file or directory)
+    // The entry was renamed or moved to this path. For a directory this is
+    // the one change the journal under-reports: its children keep records
+    // only under their old paths, so the caller must rescan the subtree.
+    bool renamed = false;
 };
 
 struct UsnChanges {

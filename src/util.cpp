@@ -110,6 +110,20 @@ std::wstring extended_path(const std::filesystem::path& p) {
     return LR"(\\?\)" + native;
 }
 
+std::wstring final_path(HANDLE h) {
+    std::wstring s(512, L'\0');
+    DWORD n = ::GetFinalPathNameByHandleW(h, s.data(), static_cast<DWORD>(s.size()),
+                                          FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (n >= s.size()) {
+        s.resize(n);
+        n = ::GetFinalPathNameByHandleW(h, s.data(), static_cast<DWORD>(s.size()),
+                                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    }
+    if (n == 0 || n >= s.size()) return {};
+    s.resize(n);
+    return s;
+}
+
 std::int64_t filetime_to_i64(const FILETIME& ft) {
     ULARGE_INTEGER u;
     u.LowPart = ft.dwLowDateTime;

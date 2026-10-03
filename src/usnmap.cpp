@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cwctype>
 #include <format>
+#include <map>
 #include <set>
 
 namespace tc {
@@ -114,11 +115,33 @@ bool UsnJournal::read_changes(const UsnState& since, const fs::path& root, UsnCh
         return false;
     }
 
-    const std::wstring root_ext = extended_path(root);
+    // Entries are matched against GetFinalPathNameByHandleW output below, so
+    // the root must be spelled by the same call: a volume reachable under two
+    // DOS names (a folder mount point plus a drive letter, a subst drive)
+    // would otherwise filter every change out while the checkpoint still
+    // advanced past them.
+    std::wstring root_ext;
+    {
+        HANDLE hr = ::CreateFileW(extended_path(root).c_str(), FILE_READ_ATTRIBUTES,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (hr == INVALID_HANDLE_VALUE) {
+            why = std::format(L"cannot open the source root: {}",
+                              win32_error_message(::GetLastError()));
+            return false;
+        }
+        root_ext = final_path(hr);
+        ::CloseHandle(hr);
+        if (root_ext.empty()) {
+            why = L"cannot resolve the source root to a canonical path";
+            return false;
+        }
+    }
     const std::wstring root_norm = to_lower(root_ext);
 
     std::set<std::wstring> removed;
-    std::set<std::array<std::uint64_t, 2>> changed_ids; // V2 fills the low half only
+    // Reasons accumulated per file ID (V2 records fill the low half only).
+    std::map<std::array<std::uint64_t, 2>, DWORD> changed_ids;
 
     READ_USN_JOURNAL_DATA_V1 rd{};
     rd.ReasonMask = 0xFFFFFFFF;
@@ -177,7 +200,7 @@ bool UsnJournal::read_changes(const UsnState& since, const fs::path& root, UsnCh
                 removed.insert(to_lower(std::move(name)));
             }
             if (known && (reason & ~(kGoneMask | USN_REASON_CLOSE)))
-                changed_ids.insert(id);
+                changed_ids[id] |= reason;
 
             off += hdr->RecordLength;
         }
@@ -189,7 +212,7 @@ bool UsnJournal::read_changes(const UsnState& since, const fs::path& root, UsnCh
     // Resolve the ids to current paths. Entries that vanished again since
     // simply fail to open; their delete records cover them.
     std::set<std::wstring> dedupe;
-    for (const auto& id : changed_ids) {
+    for (const auto& [id, reasons] : changed_ids) {
         FILE_ID_DESCRIPTOR fid{};
         fid.dwSize = sizeof fid;
         fid.Type = ExtendedFileIdType;
@@ -200,19 +223,11 @@ bool UsnJournal::read_changes(const UsnState& since, const fs::path& root, UsnCh
                                   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         if (h == INVALID_HANDLE_VALUE) continue;
 
-        std::wstring full(512, L'\0');
-        DWORD n = ::GetFinalPathNameByHandleW(h, full.data(), static_cast<DWORD>(full.size()),
-                                              FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-        if (n >= full.size()) {
-            full.resize(n);
-            n = ::GetFinalPathNameByHandleW(h, full.data(), static_cast<DWORD>(full.size()),
-                                            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-        }
+        std::wstring full = final_path(h);
         BY_HANDLE_FILE_INFORMATION info{};
         const bool have_info = ::GetFileInformationByHandle(h, &info) != 0;
         ::CloseHandle(h);
-        if (n == 0 || n >= full.size() || !have_info) continue;
-        full.resize(n);
+        if (full.empty() || !have_info) continue;
 
         const std::wstring full_norm = to_lower(full);
         std::size_t rel_pos = 0;
@@ -232,6 +247,7 @@ bool UsnJournal::read_changes(const UsnState& since, const fs::path& root, UsnCh
         e.rel = full.substr(rel_pos);
         e.is_dir = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         e.is_link = (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        e.renamed = (reasons & USN_REASON_RENAME_NEW_NAME) != 0;
         out.changed.push_back(std::move(e));
     }
 

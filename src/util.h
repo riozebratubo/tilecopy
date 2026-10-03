@@ -19,6 +19,10 @@ std::wstring win32_error_message(DWORD err);
 // Absolute path with the \\?\ prefix so long paths work everywhere.
 std::wstring extended_path(const std::filesystem::path& p);
 
+// On-disk path of an open handle (\\?\-prefixed canonical DOS form, in the
+// stored case); empty on failure.
+std::wstring final_path(HANDLE h);
+
 std::int64_t filetime_to_i64(const FILETIME& ft);
 
 std::wstring human_bytes(unsigned long long bytes);
